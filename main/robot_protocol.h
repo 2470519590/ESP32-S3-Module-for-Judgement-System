@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* All multi-byte fields are little-endian (ESP32 native byte order). */
@@ -9,18 +10,13 @@
 
 typedef enum {
     ROBOT_FRAME_STATUS = 1,
-    ROBOT_FRAME_EVENT = 2,
+    ROBOT_FRAME_DEATH = 2,
+    ROBOT_FRAME_REVIVE = 3,
+    ROBOT_FRAME_HIT = 4,
+    ROBOT_FRAME_ATTACK = 5,
+    ROBOT_FRAME_SHOOT_ENABLED = 6,
+    ROBOT_FRAME_SHOOT_DISABLED = 7,
 } robot_frame_type_t;
-
-typedef enum {
-    ROBOT_EVENT_DEATH = 1,
-    ROBOT_EVENT_REVIVE = 2,
-    ROBOT_EVENT_HIT = 3,
-    /* Send once when attack/combat starts, not once per projectile. */
-    ROBOT_EVENT_ATTACK = 4,
-    ROBOT_EVENT_SHOOT_ENABLED = 5,
-    ROBOT_EVENT_SHOOT_DISABLED = 6,
-} robot_event_type_t;
 
 /* Sent periodically at 10 Hz. Size: 10 bytes. */
 typedef struct __attribute__((packed)) {
@@ -34,20 +30,71 @@ typedef struct __attribute__((packed)) {
     uint8_t shoot_enabled;  /* 0 = forbidden, 1 = allowed */
 } robot_status_frame_t;
 
-/* Sent once for each state-changing broadcast. Size: 12 bytes. */
+/* Sent once when this robot dies. Size: 6 bytes. */
 typedef struct __attribute__((packed)) {
     uint16_t magic;
     uint8_t version;
     uint8_t frame_type;
     uint8_t robot_id;
     uint8_t team;
-    uint8_t event_type;
-    uint8_t subject_robot_id; /* 0 = this robot; hit target otherwise */
-    uint16_t value;           /* HP after hit; otherwise 0 */
-    uint16_t event_id;        /* increments for duplicate/loss diagnosis */
-} robot_event_frame_t;
+} robot_death_frame_t;
+
+/* Sent once when this robot revives. Size: 6 bytes. */
+typedef struct __attribute__((packed)) {
+    uint16_t magic;
+    uint8_t version;
+    uint8_t frame_type;
+    uint8_t robot_id;
+    uint8_t team;
+} robot_revive_frame_t;
+
+/* Sent once when this robot is hit. Size: 8 bytes. */
+typedef struct __attribute__((packed)) {
+    uint16_t magic;
+    uint8_t version;
+    uint8_t frame_type;
+    uint8_t robot_id;
+    uint8_t team;
+    uint16_t hp;
+} robot_hit_frame_t;
+
+/* Sent once when this robot enters attack/combat state. Size: 6 bytes. */
+typedef struct __attribute__((packed)) {
+    uint16_t magic;
+    uint8_t version;
+    uint8_t frame_type;
+    uint8_t robot_id;
+    uint8_t team;
+} robot_attack_frame_t;
+
+/* Sent once when this robot is allowed to shoot. Size: 6 bytes. */
+typedef struct __attribute__((packed)) {
+    uint16_t magic;
+    uint8_t version;
+    uint8_t frame_type;
+    uint8_t robot_id;
+    uint8_t team;
+} robot_shoot_enabled_frame_t;
+
+/* Sent once when this robot is forbidden from shooting. Size: 6 bytes. */
+typedef struct __attribute__((packed)) {
+    uint16_t magic;
+    uint8_t version;
+    uint8_t frame_type;
+    uint8_t robot_id;
+    uint8_t team;
+} robot_shoot_disabled_frame_t;
 
 /* Call these from normal FreeRTOS task context after obtaining data from L431. */
 void robot_network_set_status(uint16_t hp, bool alive, bool shoot_enabled);
-bool robot_network_publish_event(robot_event_type_t event_type,
-                                 uint8_t subject_robot_id, uint16_t value);
+bool robot_network_publish_death(void);
+bool robot_network_publish_revive(void);
+bool robot_network_publish_hit(uint16_t hp);
+bool robot_network_publish_attack(void);
+bool robot_network_publish_shoot_enabled(void);
+bool robot_network_publish_shoot_disabled(void);
+
+/* Raw UDP downlink reservation only. No downlink frame format is defined yet.
+ * Later, define separate frame types per business command before using it.
+ */
+void robot_network_on_server_datagram(const uint8_t *data, size_t length);

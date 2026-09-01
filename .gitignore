@@ -1,0 +1,26 @@
+# ESP-IDF / CMake generated output
+/build/
+/managed_components/
+/sdkconfig
+/sdkconfig.old
+/sdkconfig.*.old
+
+# Local IDE settings and editor state
+/.vscode/
+/.idea/
+*.code-workspace
+
+# Test captures and host-side runtime output
+/logs/
+*.log
+
+# Python cache created by host tools
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local secrets or machine-specific overrides (keep sdkconfig.defaults tracked)
+.env
+.env.*
+*.local
+secrets/

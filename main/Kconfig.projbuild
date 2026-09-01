@@ -17,4 +17,19 @@ config ROBOT_SERVER_PORT
     range 1 65535
     default 5005
 
+config ROBOT_LISTEN_PORT
+    int "Robot UDP downlink listen port"
+    range 1 65535
+    default 5006
+
+config ROBOT_REFEREE_UART_BAUD
+    int "UART0 referee-system baud rate"
+    range 1200 5000000
+    default 115200
+
+config ROBOT_RESERVED_UART_BAUD
+    int "UART1 reserved baud rate"
+    range 1200 5000000
+    default 115200
+
 endmenu
