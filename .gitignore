@@ -4,6 +4,7 @@
 /sdkconfig
 /sdkconfig.old
 /sdkconfig.*.old
+/docs_private/
 
 # Local IDE settings and editor state
 /.vscode/
