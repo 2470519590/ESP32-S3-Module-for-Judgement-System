@@ -1,0 +1,20 @@
+menu "Robot Wi-Fi"
+
+config ROBOT_WIFI_SSID
+    string "Wi-Fi SSID"
+    default "evil rats crazily squeak"
+
+config ROBOT_WIFI_PASSWORD
+    string "Wi-Fi password"
+    default "66666666"
+
+config ROBOT_SERVER_IP
+    string "Server IPv4"
+    default "10.123.59.216"
+
+config ROBOT_SERVER_PORT
+    int "Server UDP port"
+    range 1 65535
+    default 5005
+
+endmenu
