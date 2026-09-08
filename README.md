@@ -1,240 +1,226 @@
-# 校内赛小车 ESP32 Wi-Fi 通信
+# ESP32-S3 小车无线通信模块交接说明
 
-## 1. 模块用途与边界
+本文档的协议部分面向比赛服务器开发者。服务器只需要按照 UDP 帧、机器人字段和事件语义进行实现，不需要了解设备内部的数据来源或车内硬件结构；文末另列出固件联调信息和未完成事项。
 
-本工程运行在 ESP32-S3，负责把本车机器人状态和异步比赛事件通过 Wi-Fi/UDP 上报到比赛服务器。
-
-目前规划的网络路径：
+## 1. 当前固件负责什么
 
 ```text
-L431 / 车载业务逻辑 -> ESP32-S3 -> 2.4 GHz AP -> 比赛服务器
+Xbox 手柄 --BLE--> ESP32-S3 --UART0--> 底盘主控
+                         |
+                         +--UART1 <--> L431PM USART2
+                         |
+                         +--Wi-Fi UDP--> 比赛服务器
 ```
 
-当前版本已实现小车到服务器的上报；服务器到小车的 UDP 通知接收链路仅作预留，收到后暂无具体业务。服务器收到上行数据后如何展示、裁判逻辑如何判定、是否向小车发送通知，不属于本工程。
+- ESP32 解析 Xbox 手柄 HID，并通过 UART0 以约 100 Hz 输出 14 字节底盘控制帧。
+- ESP32 通过 UART1 接收 L431PM 的真实 HP、存活、射击许可、热量、功率和事件，然后转换为 V2 UDP 上行帧。
+- ESP32 接收服务器下行命令，并将比赛开始、比赛结束、设置 HP 转发给 L431PM；执行结果再通过 UDP ACK 返回服务器。
+- L431PM 是 HP、死活、比赛状态、热量、功率和射击许可的唯一权威来源。ESP32 不维护这些比赛业务。
+- 装甲板只向 L431PM 上报受击，ESP32 不直接接收装甲板 CAN。
 
-当前服务器配置：`10.123.59.216:5005`（这是我的手机热点WIFI，到时候肯定需要改）；ESP32 使用 STA 模式连接 Wi-Fi，关闭 modem sleep，保证实时性优先。
+当前 UART 引脚：
 
-## 2. 已实现功能
-
-1. ESP32-S3 自动连接指定 Wi-Fi；掉线后自动重连。
-2. 每 100 ms（10 Hz）向服务器发送一次机器人状态 UDP 帧。
-3. 状态帧包含机器人 ID、队伍、血量、存活/死亡状态、是否允许射击。
-4. 支持异步上报死亡、复活、受击、攻击、恢复射击、禁止射击；每种业务都有独立 UDP 帧。
-5. 事件通过 FreeRTOS 队列交给网络发送任务，避免业务任务直接操作 socket。
-
-## 3. UDP 协议
-
-服务器地址、端口由 `sdkconfig.defaults` / `menuconfig` 中的 `Robot Wi-Fi` 配置项确定。
-
-所有字段为 **小端序**；帧使用 `__attribute__((packed))`，不可按编译器默认对齐解析。
-
-### 3.1 状态帧：10 Hz，10 字节
-
-```c
-typedef struct __attribute__((packed)) {
-    uint16_t magic;         // 固定 0x5254
-    uint8_t  version;       // 当前 1
-    uint8_t  frame_type;    // 1 = 状态帧
-    uint8_t  robot_id;      // 本车编号
-    uint8_t  team;          // 本车队伍编号
-    uint16_t hp;            // 当前血量
-    uint8_t  alive;         // 0 = 死亡，1 = 存活
-    uint8_t  shoot_enabled; // 0 = 禁止射击，1 = 允许射击
-} robot_status_frame_t;
-```
-
-服务器以最后一次状态帧为准；连续超过预期时间未收到状态帧时，应由服务器判定该车离线。
-
-### 3.2 异步事件帧：每种业务独立定义
-
-事件发生时发送一次。每个业务是一种单独的 C 结构体和固定帧长；服务器先检查 `magic`、`version`，再根据 `frame_type` 按对应结构体解析即可。
-
-#### 死亡帧：发生死亡时发送，6 字节
-
-```c
-typedef struct __attribute__((packed)) {
-    uint16_t magic;      // 固定 0x5254
-    uint8_t  version;    // 当前 1
-    uint8_t  frame_type; // 固定 2：死亡
-    uint8_t  robot_id;   // 死亡的小车编号
-    uint8_t  team;       // 死亡小车的队伍编号
-} robot_death_frame_t;
-```
-
-#### 复活帧：发生复活时发送，6 字节
-
-```c
-typedef struct __attribute__((packed)) {
-    uint16_t magic;      // 固定 0x5254
-    uint8_t  version;    // 当前 1
-    uint8_t  frame_type; // 固定 3：复活
-    uint8_t  robot_id;   // 复活的小车编号
-    uint8_t  team;       // 复活小车的队伍编号
-} robot_revive_frame_t;
-```
-
-#### 受击帧：本车受击且血量已更新时发送，8 字节
-
-```c
-typedef struct __attribute__((packed)) {
-    uint16_t magic;      // 固定 0x5254
-    uint8_t  version;    // 当前 1
-    uint8_t  frame_type; // 固定 4：受击
-    uint8_t  robot_id;   // 受击的小车编号
-    uint8_t  team;       // 受击小车的队伍编号
-    uint16_t hp;         // 受击后的本车血量，小端序
-} robot_hit_frame_t;
-```
-
-#### 攻击帧：本车进入攻击/战斗状态时发送，6 字节
-
-```c
-typedef struct __attribute__((packed)) {
-    uint16_t magic;      // 固定 0x5254
-    uint8_t  version;    // 当前 1
-    uint8_t  frame_type; // 固定 5：攻击
-    uint8_t  robot_id;   // 发起攻击的小车编号
-    uint8_t  team;       // 发起攻击小车的队伍编号
-} robot_attack_frame_t;
-```
-
-攻击帧表示“进入攻击/战斗状态”，不是每发子弹发送一次。
-
-#### 恢复射击帧：本车恢复射击权限时发送，6 字节
-
-```c
-typedef struct __attribute__((packed)) {
-    uint16_t magic;      // 固定 0x5254
-    uint8_t  version;    // 当前 1
-    uint8_t  frame_type; // 固定 6：允许射击
-    uint8_t  robot_id;   // 恢复射击的小车编号
-    uint8_t  team;       // 该小车的队伍编号
-} robot_shoot_enabled_frame_t;
-```
-
-#### 禁止射击帧：本车被禁止射击时发送，6 字节
-
-```c
-typedef struct __attribute__((packed)) {
-    uint16_t magic;      // 固定 0x5254
-    uint8_t  version;    // 当前 1
-    uint8_t  frame_type; // 固定 7：禁止射击
-    uint8_t  robot_id;   // 被禁止射击的小车编号
-    uint8_t  team;       // 该小车的队伍编号
-} robot_shoot_disabled_frame_t;
-```
-
-独立帧的意义：每个 `frame_type` 的业务含义、字段和长度唯一，不用再在一个通用事件包里猜 `event_type`、`value` 分别代表什么。持续状态仍以 10 Hz 状态帧为准。
-
-### 3.3 服务器下行：仅保留 UDP 接收入口
-
-ESP32 监听 UDP `5006`；服务器未来可单播到小车 IP，也可发送 AP 网段广播。当前未定义任何下行报文格式、目标字段或业务语义。收到任意 UDP 数据后，ESP32 仅交给空弱回调 `robot_network_on_server_datagram(data, length)`，不会执行任何小车动作。
-
-后续真正增加禁射、复活等下行功能时，必须为每个业务分别定义自己的帧和处理函数；不要在当前工程中添加通用通知帧。
-
-## 4. 业务层调用方式
-
-协议定义和接口在 `main/robot_protocol.h`。
-
-L431 数据接入完成后，由接收/业务任务在普通 FreeRTOS 任务上下文中调用：
-
-```c
-/* 每次本车状态更新时调用；网络任务会以 10 Hz 发送最新快照。 */
-robot_network_set_status(hp, alive, shoot_enabled);
-
-/* 发生一次性事件时调用。返回 false 表示 16 深度事件队列已满。 */
-robot_network_publish_death();
-robot_network_publish_revive();
-robot_network_publish_hit(hp_after_hit);
-robot_network_publish_attack();
-robot_network_publish_shoot_enabled();
-robot_network_publish_shoot_disabled();
-```
-
-当前初始状态为：HP=200、存活、允许射击。当前本车 ID 和队伍均为 `1`，在 `main/main.c` 顶部修改：
-
-```c
-#define LOCAL_ROBOT_ID 1U
-#define LOCAL_ROBOT_TEAM 1U
-```
-
-每辆车必须使用不同 `LOCAL_ROBOT_ID`；队伍编号必须与服务器约定一致。
-
-## 5. 编译、烧录与配置
-
-使用 ESP-IDF v6.0.2，目标为 `esp32s3`。当前工程已关闭 PSRAM，以兼容板卡实际 PSRAM 型号不确定的情况。
-
-需要修改网络时，改 `sdkconfig.defaults` 中：
-
-```text
-CONFIG_ROBOT_WIFI_SSID="..."
-CONFIG_ROBOT_WIFI_PASSWORD="..."
-CONFIG_ROBOT_SERVER_IP="..."
-CONFIG_ROBOT_SERVER_PORT=5005
-CONFIG_ROBOT_LISTEN_PORT=5006
-CONFIG_ROBOT_REFEREE_UART_BAUD=115200
-CONFIG_ROBOT_RESERVED_UART_BAUD=115200
-```
-
-配置变更后需要重新配置并编译；仅修改 `main/main.c` 或 `main/robot_protocol.h` 时应为增量编译。
-
-固件产物：
-
-```text
-build/esp32_wifi_quality.bin
-```
-
-VS Code ESP-IDF 扩展中使用 **UART** 烧录，端口当前配置为 `COM24`。不要选择 JTAG/OpenOCD；该开发板使用 USB-UART 下载。
-
-应用日志已切到 ESP32-S3 原生 USB Serial/JTAG；UART0 不输出应用日志，避免污染裁判通信。烧录仍使用 USB-UART。
-
-### 5.1 串口预留与接线
-
-UART0 用于裁判系统，已初始化为 `115200, 8N1, 无硬件流控`；波特率可通过 `CONFIG_ROBOT_REFEREE_UART_BAUD` 修改。UART1 同样已初始化为 `115200, 8N1, 无硬件流控`，但只作备用，当前没有业务。
-
-| ESP32 串口 | ESP32 GPIO / 板上排针 | 接到外部设备时的连接方式 | 当前用途 |
+| 接口 | ESP32 引脚 | 对端 | 用途 |
 |---|---|---|---|
-| UART0 | GPIO43 / `TX` | ESP32 `TX` -> 裁判系统 `RX` | 裁判系统通信 |
-| UART0 | GPIO44 / `RX` | ESP32 `RX` <- 裁判系统 `TX` | 裁判系统通信 |
-| UART1 | GPIO17 | ESP32 `TX` -> 备用设备 `RX` | 预留 |
-| UART1 | GPIO18 | ESP32 `RX` <- 备用设备 `TX` | 预留 |
+| UART0 | GPIO43 TX、GPIO44 RX | 底盘主控 RX/TX | 手柄控制帧；正式运行不输出文本 |
+| UART1 | GPIO17 TX、GPIO18 RX | L431 PA3 RX、PA2 TX | L431PM 状态、事件和命令回执 |
 
-UART0、UART1 当前均运行最小 `ping/pong` 接收任务，用于验证串口接线和收发方向：发送 ASCII `ping` 后，ESP32 会从**同一串口**回复：
+两条 UART 均为 `115200 8N1`，交叉连接并共地。完整 UART0 控制帧见 `docs/手柄接收机通信协议.md`；L431PM 对接帧见 `docs/L431PM_对接任务提示词.md`。
 
-| 测试串口 | 回复内容 |
-|---|---|
-| UART0 | `u0:pong\r\n` |
-| UART1 | `u1:pong\r\n` |
+## 2. V2 UDP 总规则
 
-`ping` 后带不带回车均可；每次连续匹配到 `ping` 都会回复一次。
+- ESP32 → 服务器：目标服务器 UDP `5005`。
+- 服务器 → ESP32：目标 ESP32 UDP `5006`。
+- 服务器程序应使用一个绑定 `5005` 的 UDP socket 同时接收上行和发送下行。这样 ESP32 的 ACK 会返回到服务器 `5005`。
+- ESP32 只接受配置服务器 IP 发来的下行包；其他来源会被丢弃。
+- 所有 V2 帧均为固定长度二进制、无额外转义；多字节整数为 little-endian。
+- 公共头部为 `magic=0x5254`，在线路上为 `54 52`，`version=2`。
+- 必须按 `version + frame_type + 精确帧长` 解码，不能按 V1 长度猜测。
 
-这只是接线自检，不是裁判协议。裁判系统协议接入时，需要移除/替换 UART0 的 `ping/pong` 任务并新增独立解析任务；不要把裁判数据直接混入 Wi-Fi UDP 协议。
+公共头部不是独立帧，所有帧均直接包含：
 
-## 6. 当前未实现项
+```text
+magic[2] | version[1] | frame_type[1] | payload...
+```
 
-1. **尚未接入裁判系统 UART 协议。** UART0（GPIO43/44）已初始化并运行 `ping/pong` 接线自检，UART1（GPIO17/18）同样运行该自检；当前状态值仍为 ESP32 内部初始值。下一位开发者需要以裁判协议任务替换 UART0 自检任务，并在收到数据后调用 `robot_network_set_status()` 及对应的独立事件 API。
-2. **没有 UDP ACK、重传或持久化。** 当前事件是单次 UDP 上报，事件队列满或 Wi-Fi 断开时可能丢失。若比赛规则要求死亡/复活等事件必须可靠送达，需要按具体事件分别补 ACK、超时重传和去重逻辑。
-3. **没有服务器端程序。** 服务器需要按本 README 的小端二进制结构解析 UDP `5005` 端口。
-4. **下行控制尚未实现。** ESP32 已预留 UDP `5006` 的原始接收入口，但没有定义任何下行帧，没有接入 L431 或业务执行。
-5. **下行单播/广播仅预留，服务器端尚未实现。** 服务器未来可单播到单车 IP，也可向 AP 网段广播地址的 UDP `5006` 发送数据；ESP32 已能收到并交给空回调，但当前不会解析、过滤、转发或执行。
+## 3. ESP32 → 服务器上行帧
 
-## 7. 文件职责
+### 3.1 状态帧：13 字节，约 10 Hz
 
-| 文件 | 职责 |
-|---|---|
-| `main/main.c` | UART0/1 初始化和 `ping/pong` 自检、Wi-Fi 连接、状态快照、事件队列、UDP 上行发送与下行原始数据接收任务 |
-| `main/robot_protocol.h` | 正式上行协议结构、独立事件帧与供 UART/业务层调用的 API |
-| `main/Kconfig.projbuild` | Wi-Fi、服务器地址/端口、下行监听端口和 UART 波特率配置 |
-| `sdkconfig.defaults` | 当前默认网络配置、关闭 PSRAM |
-| `host/wifi_monitor.py` | 旧 Wi-Fi 测试工具；正式比赛不运行 |
+```text
+offset  size  field
+0       2     magic = 0x5254
+2       1     version = 2
+3       1     frame_type = 0x01
+4       1     robot_id
+5       2     hp (uint16, little-endian)
+7       2     heat (uint16, little-endian)
+9       2     power (uint16, little-endian, W)
+11      1     alive (0/1)
+12      1     shoot_enabled (0/1)
+```
 
-## 8. 上车前检查清单
+状态帧是发送端提供的当前机器人状态快照。服务器应直接读取其中的 `robot_id、hp、heat、power、alive、shoot_enabled`。当前状态帧只定义这些业务字段，不包含额外的网络诊断字段、时间戳或 CRC；服务器可使用本地 UDP 接收时间统计报文间隔和丢包情况。
 
-- 每辆车的 `LOCAL_ROBOT_ID` 是否唯一；
-- `LOCAL_ROBOT_TEAM` 是否正确；
-- 服务器 IP、UDP 端口是否与服务器一致；
-- 服务器是否按小端序、10 字节状态帧及各独立事件帧解析；
-- 如启用下行功能，是否先为该具体业务定义独立帧，再向 UDP `5006` 发送；
-- L431 接入后是否在状态变化时更新 `hp/alive/shoot_enabled`；
-- 死亡、复活、受击、攻击、恢复/禁止射击是否都调用了事件 API；
-- Wi-Fi AP 是否固定 2.4 GHz 信道，且所有小车能稳定连接。
+### 3.2 独立事件帧
+
+普通事件固定 5 字节：`54 52 02 type robot_id`。
+
+| `type` | 事件 | 是否 ACK | 说明 |
+|---:|---|---|---|
+| `0x04` | 受击 | 否 | 只表示发生受击，不携带伤害和 HP；HP 以随后状态帧为准 |
+| `0x05` | 攻击 | 否 | 发送端确认一次有效射击后产生 |
+| `0x06` | 允许射击 | 否 | 发送端检测到射击许可变为允许后产生 |
+| `0x07` | 禁止射击 | 否 | 发送端检测到射击许可变为禁止后产生 |
+| `0x08` | 上游业务链路断开 | 否 | 发送端未收到上游状态后产生 |
+| `0x09` | 上游业务链路恢复 | 否 | 发送端重新收到有效状态后产生 |
+
+死亡、复活为可靠事件，固定 9 字节：
+
+```text
+54 52 02 type robot_id transaction_id[4]
+```
+
+其中 `type=0x02` 为死亡，`type=0x03` 为复活；`transaction_id` 为 little-endian `uint32`。服务器收到后必须回一个 ACK，且同一 `(robot_id, type, transaction_id)` 只能执行业务一次，但重复收到时仍要回 ACK。
+
+## 4. 服务器 → ESP32 下行帧
+
+下行帧的目标地址是 ESP32 IP 的 UDP `5006`。除分配帧外，`target_robot_id=0` 表示广播，非 0 表示只处理匹配本车 ID 的 ESP32。
+
+| `type` | 命令 | 长度 | 字节布局 | ACK |
+|---:|---|---:|---|---|
+| `0x81` | 比赛开始 | 9 B | `54 52 02 81 target_id tx[4]` | 是 |
+| `0x82` | 比赛结束 | 9 B | `54 52 02 82 target_id tx[4]` | 是 |
+| `0x83` | 分配机器人 ID 和手柄 MAC | 15 B | `54 52 02 83 robot_id mac[6] tx[4]` | 是 |
+| `0x84` | 请求立即状态 | 5 B | `54 52 02 84 target_id` | 否 |
+| `0x85` | 设置 HP | 11 B | `54 52 02 85 target_id hp[2] tx[4]` | 是 |
+
+`0x83` 必须单播到已知的 ESP32 IP，因为它本身没有 `target_id` 字段。MAC 以 6 个原始字节发送，例如 `8d:23:ab:a5:3c:c9` 对应 `8D 23 AB A5 3C C9`。
+
+`SET_HP` 是直接设置 HP，不是“扣 20”命令；合法范围是 `0..300`。正常受击事件由设备业务自行产生，服务器不应通过 `SET_HP=当前 HP-20` 模拟一次受击。
+
+## 5. ACK、事务号和重传
+
+ACK 固定 10 字节：
+
+```text
+54 52 02 F0 acked_frame_type transaction_id[4] result
+```
+
+`result` 定义：`0=成功`，`1=不允许`，`2=失败`。
+
+服务器必须实现：
+
+1. `0x81/0x82/0x83/0x85` 使用非 0 的 `uint32 transaction_id`。
+2. 等待 ACK；无 ACK 时用相同帧、相同事务号重发，不要生成新事务号。
+3. 对 ESP32 上报的死亡/复活回 ACK，并按事务号去重。
+4. 只有收到 `result=0` 才认为下行命令执行成功；`1/2` 应记录失败或进入人工处理。
+5. `0x84`、状态帧、受击、攻击、射击许可和上游链路事件不需要 ACK。
+
+当前设备行为：关键下行命令收到重复事务时不会重复执行，而是返回已保存结果；死亡/复活待 ACK 记录保存在设备非易失存储器中，断电重启后仍会继续上报。
+
+当前协议没有定义服务器身份认证、时间戳、CRC、设备发现或会话层。服务器暂时不要自行添加会改变固定帧的字段。
+
+## 6. 服务器应先实现的内容
+
+服务器可以按下面顺序直接开始：
+
+1. 绑定 `0.0.0.0:5005`，严格解析 13 字节状态帧、5/9 字节事件帧和 10 字节 ACK。
+2. 用 `robot_id` 建立状态表；状态帧的 UDP 源 IP 是当前 ESP32 的可回送地址。
+3. 对死亡/复活按事务号去重并回 ACK。
+4. 实现下行帧构造、ACK 等待和相同事务号重传。
+5. 开局时对每车单播 `SET_HP=300`，收到成功 ACK 后再发送比赛开始；比赛结束发送结束命令。
+6. 将受击、攻击、死亡、复活和射击许可作为独立事件处理，不从状态帧推断事件发生次数。
+
+服务器应保存的最小数据：`robot_id`、最近状态、最近 UDP 源 IP、最后接收时间、事件去重键、下行事务状态。状态帧中的 `hp/alive/shoot_enabled` 是展示和校验用的 L431 快照，服务器不应在 ESP32 内重新维护一套 HP。
+
+## 7. 当前测试 CLI
+
+文件：`host/test_server_cli.py`。它是当前联调使用的服务器替身，不是最终比赛服务器。
+
+启动：
+
+```powershell
+E:\miniconda\envs\py310\python.exe host\test_server_cli.py --bind 0.0.0.0 --port 5005 --robot-port 5006
+```
+
+CLI 界面上方显示实时状态，下方是可输入命令的输入框。命令只输入机器人 ID，不输入 ESP32 IP：
+
+```text
+help
+stats
+assign 1 8d:23:ab:a5:3c:c9
+hp 1 300
+status 1
+start 1
+end 1
+quit
+```
+
+CLI 通过已收到的状态帧自动建立 `robot_id -> UDP 源 IP` 映射，因此正常顺序是：
+
+```text
+ESP32 先上报状态 -> CLI 记录 R1 的源 IP -> 再执行 assign/hp/start/end
+```
+
+如果提示 `robot 1 has not sent a status frame`，不是 HP 帧错误，而是 CLI 尚未知道该机器人 IP。当前协议没有设备发现或“无 ID ESP32 首次注册”流程；正式服务器若要支持全新设备首次分配，仍需另行确定部署方式或新增协议。
+
+CLI 当前会自动回复死亡/复活事件 ACK，显示 ESP32 返回的 UDP ACK，并打印发送帧十六进制。它不等同于正式服务器，尚未实现完整的服务器数据库、可靠命令自动重试策略、正式设备注册和比赛业务状态机。
+
+## 8. 多 ESP32 接入和正式网络
+
+### 8.1 多车支持
+
+V2 UDP 协议和 ESP32 上行 socket 支持多台 ESP32 同时连接同一个服务器：每台 ESP32 使用自己的 UDP 源端口，服务器使用 `robot_id` 区分车辆；所有车辆可以共同向服务器的 `5005` 发送状态和事件。
+
+多车正常工作的必要条件：
+
+- 每台车必须拥有唯一的 `robot_id`，不能多台都使用 `1`。
+- 每台车连接同一个比赛 Wi-Fi，并把服务器地址配置为同一个服务器 IP。
+- 服务器按 `robot_id` 保存最近状态、源 IP 和事务记录；不能用一个全局状态覆盖所有车辆。
+- 下行命令按目标车的 IP 发送到 UDP `5006`；广播开始/结束使用 `target_robot_id=0`，服务器要分别等待各车 ACK。
+- 当前协议没有设备发现。全新设备首次分配 ID/MAC 前，服务器必须通过预配置、现场登记或其他部署方式获得 ESP32 IP。
+
+当前 CLI 的 `robot_id -> IP` 映射表可以同时保存多个机器人，但只在收到状态帧后建立映射。当前联调固件默认使用 `robot_id=1`，多车测试前必须为每台车写入不同的持久化 ID。
+
+### 8.2 正式比赛网络配置
+
+交接和服务器开发按下面的正式网络配置：
+
+```text
+Wi-Fi SSID: RM_GAME
+Wi-Fi 密码: 12345678
+服务器 IP: 192.168.1.3
+ESP32 -> 服务器 UDP: 5005
+服务器 -> ESP32 UDP: 5006
+```
+
+临时测试网络不属于正式协议和正式部署配置，不在本文档中列出。注意：当前源码仍有编译期开关 `USE_INTEGRATION_TEST_NETWORK`；发布正式固件前必须将其关闭并重新构建，否则仅修改 Kconfig 不会切换到下面的正式网络。服务器应监听 `192.168.1.3:5005`。
+
+正式模式下 `CONFIG_ROBOT_TEST_MODE=n`，不会生成假比赛数据；状态和事件必须来自设备的真实业务输入。
+
+## 8.3 当前固件已具备
+
+当前已具备：
+
+- Xbox BLE 指定地址连接、16 字节 HID 接收和 UART0 14 字节控制帧输出。
+- 上游串口状态/事件/ACK 解析。
+- V2 UDP 状态、事件、下行命令和 ACK。
+- 机器人 ID、手柄 MAC、未确认死亡/复活事务、已执行下行事务结果的 NVS 保存。
+- 上游业务链路断开/恢复事件。
+
+## 9. 暂未实现或需要服务器确认的事项
+
+- 正式网络发布构建：当前源码的 `USE_INTEGRATION_TEST_NETWORK` 仍需关闭后重新构建，Kconfig 中的正式网络参数才会生效。
+- 全新 ESP32 的无状态设备发现和首次 ID 分配：当前必须有已知 IP，或 ESP32 先用已有/持久化 ID 上报状态。
+- 正式服务器端的设备表、命令重试、事务持久化、权限和比赛状态机：CLI 只用于联调。
+- 服务器下发“设置蓝牙地址”后的现场流程尚未做成正式配置工具；ESP32 固件会保存 MAC 并重连该地址，但服务器如何获得初始设备 IP 仍是部署问题。
+- 当前 V2 状态帧不包含额外网络诊断字段；若正式比赛需要新增诊断信息，应新增版本或独立诊断帧，不能修改当前 V2 状态帧长度。
+- ESP32 不向服务器上报手柄原始 HID，也不向服务器提供电机控制量；底盘控制留在 UART0 和主控。
+
+更细的结构定义和历史变更见：
+
+- `docs/v2更新说明.md`
+- `docs/开发计划书.md`
+- `docs/手柄接收机通信协议.md`
+- `docs/L431PM_对接任务提示词.md`

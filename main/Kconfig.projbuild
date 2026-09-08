@@ -2,15 +2,15 @@ menu "Robot Wi-Fi"
 
 config ROBOT_WIFI_SSID
     string "Wi-Fi SSID"
-    default "evil rats crazily squeak"
+    default "RM_GAME"
 
 config ROBOT_WIFI_PASSWORD
     string "Wi-Fi password"
-    default "66666666"
+    default "12345678"
 
 config ROBOT_SERVER_IP
     string "Server IPv4"
-    default "10.123.59.216"
+    default "192.168.1.3"
 
 config ROBOT_SERVER_PORT
     int "Server UDP port"
@@ -31,5 +31,26 @@ config ROBOT_RESERVED_UART_BAUD
     int "UART1 reserved baud rate"
     range 1200 5000000
     default 115200
+
+config ROBOT_TEST_MODE
+    bool "Generate simulated match data"
+    default y
+    help
+        Send the normal 10 Hz status frames and generate one simulated
+        asynchronous match event every 3 to 6 seconds. Disable before
+        connecting the real referee system.
+
+config ROBOT_TEST_FALLBACK_WIFI_SSID
+    string "Test-only fallback Wi-Fi SSID"
+    default "evil rats crazily squeak"
+    help
+        Used only when ROBOT_TEST_MODE is enabled and the primary Wi-Fi has
+        not connected within 10 seconds after boot.
+
+config ROBOT_TEST_FALLBACK_WIFI_PASSWORD
+    string "Test-only fallback Wi-Fi password"
+    default "66666666"
+    help
+        Used only with ROBOT_TEST_FALLBACK_WIFI_SSID in test mode.
 
 endmenu
