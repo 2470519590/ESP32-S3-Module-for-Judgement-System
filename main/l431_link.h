@@ -9,6 +9,7 @@ typedef struct {
     uint16_t power;
     bool alive;
     bool shoot_enabled;
+    bool power_on;
     uint8_t sequence;
 } l431_status_t;
 

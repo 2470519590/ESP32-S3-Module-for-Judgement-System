@@ -33,6 +33,9 @@ FRAME_GAME_END = 0x82
 FRAME_ASSIGNMENT = 0x83
 FRAME_STATUS_REQUEST = 0x84
 FRAME_SET_HP = 0x85
+FRAME_YELLOW_CARD = 0x86
+FRAME_FORCE_POWER_OFF = 0x87
+FRAME_FORCE_POWER_ON = 0x88
 FRAME_ACK = 0xF0
 
 EVENT_NAMES = {
@@ -69,10 +72,10 @@ def decode(data: bytes) -> str:
             return f"V1 EVENT type={frame_type} robot={robot} team={team}"
 
     if version == V2:
-        if frame_type == FRAME_STATUS and len(data) == 13:
-            _, _, _, robot, hp, heat, power, alive, shoot = struct.unpack("<HBBBHHHBB", data)
+        if frame_type == FRAME_STATUS and len(data) == 14:
+            _, _, _, robot, hp, heat, power, alive, shoot, power_on = struct.unpack("<HBBBHHHBBB", data)
             return (f"V2 STATUS robot={robot} hp={hp} heat={heat} power={power}W "
-                    f"alive={alive} shoot={shoot}")
+                    f"alive={alive} shoot={shoot} power={'ON' if power_on else 'OFF'}")
         if frame_type == FRAME_ACK and len(data) == 10:
             _, _, _, acked_type, transaction_id, result = struct.unpack("<HBBBIB", data)
             return f"V2 ACK type=0x{acked_type:02X} tx={transaction_id} result={result}"
@@ -105,7 +108,7 @@ class CliServer:
     last_rx_time: float | None = None
     max_gap_ms: float = 0.0
     event_counts: dict[int, int] = field(default_factory=dict)
-    last_status: dict[int, tuple[int, int, int, int, int]] = field(default_factory=dict)
+    last_status: dict[int, tuple[int, int, int, int, int, int]] = field(default_factory=dict)
     last_event: str = "-"
     ui_message: Callable[[str], None] | None = None
     robot_peers: dict[int, str] = field(default_factory=dict)
@@ -157,10 +160,10 @@ class CliServer:
             self.last_rx_time = now
             if len(data) >= 4 and data[:2] == struct.pack("<H", MAGIC) and data[2] == V2:
                 frame_type = data[3]
-                if frame_type == FRAME_STATUS and len(data) == 13:
-                    _, _, _, robot, hp, heat, power, alive, shoot = struct.unpack(
-                        "<HBBBHHHBB", data)
-                    self.last_status[robot] = (hp, heat, power, alive, shoot)
+                if frame_type == FRAME_STATUS and len(data) == 14:
+                    _, _, _, robot, hp, heat, power, alive, shoot, power_on = struct.unpack(
+                        "<HBBBHHHBBB", data)
+                    self.last_status[robot] = (hp, heat, power, alive, shoot, power_on)
                     self.robot_peers[robot] = peer[0]
                     self.window_status += 1
                 elif frame_type == FRAME_ACK and len(data) == 10:
@@ -190,8 +193,9 @@ class CliServer:
             max_gap = self.max_gap_ms
             self.max_gap_ms = 0.0
             states = " ".join(
-                f"R{robot}:hp={hp} alive={alive} shoot={shoot}"
-                for robot, (hp, _heat, _power, alive, shoot) in sorted(self.last_status.items())
+                f"R{robot}:hp={hp} heat={heat} power={power}W alive={alive} shoot={shoot} "
+                f"pwr={'ON' if power_on else 'OFF'}"
+                for robot, (hp, heat, power, alive, shoot, power_on) in sorted(self.last_status.items())
             ) or "-"
             event_text = " ".join(f"{EVENT_NAMES.get(kind, f'0x{kind:02X}')}:{count}"
                                   for kind, count in sorted(self.event_counts.items())) or "-"
@@ -290,7 +294,7 @@ def server_command(self: CliServer, line: str) -> bool:
     if name in {"quit", "exit"}:
         return False
     if name == "help":
-        self.output("Commands: stats | start ROBOT_ID | end ROBOT_ID | hp ROBOT_ID HP | status ROBOT_ID | assign ROBOT_ID CONTROLLER_MAC | quit")
+        self.output("Commands: stats | start ROBOT_ID | end ROBOT_ID | yellow ROBOT_ID | power_on ROBOT_ID | power_off ROBOT_ID | hp ROBOT_ID HP | status ROBOT_ID | assign ROBOT_ID CONTROLLER_MAC | quit")
         return True
     if name == "stats":
         self.output(self.summary())
@@ -326,6 +330,24 @@ def server_command(self: CliServer, line: str) -> bool:
             ip = self.robot_ip(robot_id)
             frame = struct.pack("<HBBB", MAGIC, V2, FRAME_STATUS_REQUEST, robot_id)
             self.send(ip, frame, f"STATUS_REQUEST target={robot_id}")
+        elif name in {"yellow", "yellow_card"} and len(parts) == 2:
+            robot_id = int(parts[1])
+            ip = self.robot_ip(robot_id)
+            tx = self.next_transaction()
+            frame = struct.pack("<HBBBI", MAGIC, V2, FRAME_YELLOW_CARD, robot_id, tx)
+            self.send(ip, frame, f"YELLOW_CARD target={robot_id} tx={tx}")
+        elif name in {"power_off", "force_power_off", "shutdown"} and len(parts) == 2:
+            robot_id = int(parts[1])
+            ip = self.robot_ip(robot_id)
+            tx = self.next_transaction()
+            frame = struct.pack("<HBBBI", MAGIC, V2, FRAME_FORCE_POWER_OFF, robot_id, tx)
+            self.send(ip, frame, f"FORCE_POWER_OFF target={robot_id} tx={tx}")
+        elif name in {"power_on", "force_power_on", "startup"} and len(parts) == 2:
+            robot_id = int(parts[1])
+            ip = self.robot_ip(robot_id)
+            tx = self.next_transaction()
+            frame = struct.pack("<HBBBI", MAGIC, V2, FRAME_FORCE_POWER_ON, robot_id, tx)
+            self.send(ip, frame, f"FORCE_POWER_ON target={robot_id} tx={tx}")
         else:
             self.output("Invalid command. Type help.")
     except (ValueError, OSError, struct.error) as exc:

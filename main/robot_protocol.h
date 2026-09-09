@@ -23,10 +23,13 @@ typedef enum {
     ROBOT_FRAME_ASSIGNMENT = 0x83,
     ROBOT_FRAME_STATUS_REQUEST = 0x84,
     ROBOT_FRAME_SET_HP = 0x85,
+    ROBOT_FRAME_YELLOW_CARD = 0x86,
+    ROBOT_FRAME_FORCE_POWER_OFF = 0x87,
+    ROBOT_FRAME_FORCE_POWER_ON = 0x88,
     ROBOT_FRAME_ACK = 0xF0,
 } robot_frame_type_t;
 
-/* ESP32 -> server, 10 Hz. Size: 13 bytes. */
+/* ESP32 -> server, 10 Hz. Size: 14 bytes. */
 typedef struct __attribute__((packed)) {
     uint16_t magic;
     uint8_t version;
@@ -37,6 +40,7 @@ typedef struct __attribute__((packed)) {
     uint16_t power;
     uint8_t alive;
     uint8_t shoot_enabled;
+    uint8_t power_on;
 } robot_status_v2_frame_t;
 
 /* ESP32 -> server, non-reliable events. Size: 5 bytes. */
@@ -65,6 +69,33 @@ typedef struct __attribute__((packed)) {
     uint8_t target_robot_id;
     uint32_t transaction_id;
 } robot_game_control_v2_frame_t;
+
+/* Server -> ESP32, one yellow-card penalty. Size: 9 bytes. */
+typedef struct __attribute__((packed)) {
+    uint16_t magic;
+    uint8_t version;
+    uint8_t frame_type;
+    uint8_t target_robot_id;
+    uint32_t transaction_id;
+} robot_yellow_card_v2_frame_t;
+
+/* Server -> ESP32, force L431PM to switch off chassis output. Size: 9 bytes. */
+typedef struct __attribute__((packed)) {
+    uint16_t magic;
+    uint8_t version;
+    uint8_t frame_type;
+    uint8_t target_robot_id;
+    uint32_t transaction_id;
+} robot_force_power_off_v2_frame_t;
+
+/* Server -> ESP32, request L431PM to switch on chassis output. Size: 9 bytes. */
+typedef struct __attribute__((packed)) {
+    uint16_t magic;
+    uint8_t version;
+    uint8_t frame_type;
+    uint8_t target_robot_id;
+    uint32_t transaction_id;
+} robot_force_power_on_v2_frame_t;
 
 /* Server -> ESP32, persistent robot and controller assignment. Size: 15 bytes. */
 typedef struct __attribute__((packed)) {

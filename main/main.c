@@ -34,7 +34,7 @@
 #ifndef CONFIG_ROBOT_TEST_MODE
 #define CONFIG_ROBOT_TEST_MODE 0
 #endif
-#define TEST_SERVER_IP "10.153.217.216"
+#define TEST_SERVER_IP "10.25.81.216"
 /* Current formal-business integration uses the temporary test network.
  * This selects only Wi-Fi/server endpoints; simulated data remains disabled. */
 #define USE_INTEGRATION_TEST_NETWORK 1
@@ -79,6 +79,7 @@ typedef struct {
     uint16_t power;
     bool alive;
     bool shoot_enabled;
+    bool power_on;
 } robot_state_t;
 
 typedef struct {
@@ -131,6 +132,7 @@ static void l431_on_status(const l431_status_t *status, void *context)
     s_state.power = status->power;
     s_state.alive = status->alive;
     s_state.shoot_enabled = status->shoot_enabled;
+    s_state.power_on = status->power_on;
     xSemaphoreGive(s_status_mutex);
     s_l431_status_seen = true;
     s_l431_last_status_tick = xTaskGetTickCount();
@@ -440,6 +442,7 @@ static void send_current_status(int sock, const struct sockaddr_in *server)
         .power = state.power,
         .alive = state.alive ? 1U : 0U,
         .shoot_enabled = state.shoot_enabled ? 1U : 0U,
+        .power_on = state.power_on ? 1U : 0U,
     };
     send_frame(sock, server, &status, sizeof(status));
 }
@@ -555,6 +558,49 @@ static void handle_server_datagram(int sock, const uint8_t *data, size_t length,
         return;
     }
 
+    if (data[3] == ROBOT_FRAME_YELLOW_CARD &&
+        length == sizeof(robot_yellow_card_v2_frame_t)) {
+        const robot_yellow_card_v2_frame_t *command = (const void *)data;
+        /* A penalty is always for one explicitly identified robot. */
+        if (command->target_robot_id == 0U ||
+            !downlink_targets_this_robot(command->target_robot_id)) return;
+        uint8_t result;
+        if (!find_completed_downlink(command->frame_type, command->transaction_id, &result)) {
+            result = forward_l431_command(0xC4U, command->transaction_id, 0U);
+            if (result != 2U) remember_completed_downlink(command->frame_type, command->transaction_id, result);
+        }
+        send_server_ack(sock, peer, command->frame_type, command->transaction_id, result);
+        return;
+    }
+
+    if (data[3] == ROBOT_FRAME_FORCE_POWER_OFF &&
+        length == sizeof(robot_force_power_off_v2_frame_t)) {
+        const robot_force_power_off_v2_frame_t *command = (const void *)data;
+        if (command->target_robot_id == 0U ||
+            !downlink_targets_this_robot(command->target_robot_id)) return;
+        uint8_t result;
+        if (!find_completed_downlink(command->frame_type, command->transaction_id, &result)) {
+            result = forward_l431_command(0xC5U, command->transaction_id, 0U);
+            if (result != 2U) remember_completed_downlink(command->frame_type, command->transaction_id, result);
+        }
+        send_server_ack(sock, peer, command->frame_type, command->transaction_id, result);
+        return;
+    }
+
+    if (data[3] == ROBOT_FRAME_FORCE_POWER_ON &&
+        length == sizeof(robot_force_power_on_v2_frame_t)) {
+        const robot_force_power_on_v2_frame_t *command = (const void *)data;
+        if (command->target_robot_id == 0U ||
+            !downlink_targets_this_robot(command->target_robot_id)) return;
+        uint8_t result;
+        if (!find_completed_downlink(command->frame_type, command->transaction_id, &result)) {
+            result = forward_l431_command(0xC6U, command->transaction_id, 0U);
+            if (result != 2U) remember_completed_downlink(command->frame_type, command->transaction_id, result);
+        }
+        send_server_ack(sock, peer, command->frame_type, command->transaction_id, result);
+        return;
+    }
+
     if (data[3] == ROBOT_FRAME_SET_HP && length == sizeof(robot_set_hp_v2_frame_t)) {
         const robot_set_hp_v2_frame_t *command = (const void *)data;
         if (!downlink_targets_this_robot(command->target_robot_id) || command->hp > 300U) return;
@@ -628,6 +674,7 @@ static void robot_send_task(void *arg)
             .power = state.power,
             .alive = state.alive ? 1U : 0U,
             .shoot_enabled = state.shoot_enabled ? 1U : 0U,
+            .power_on = state.power_on ? 1U : 0U,
         };
         send_frame(sock, &server, &status, sizeof(status));
         service_reliable_events(sock, &server);
