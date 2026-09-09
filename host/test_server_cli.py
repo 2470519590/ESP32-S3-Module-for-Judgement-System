@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import argparse
+import secrets
 import shlex
 import socket
 import struct
@@ -94,7 +95,10 @@ def decode(data: bytes) -> str:
 class CliServer:
     sock: socket.socket
     robot_port: int
-    transaction_id: int = 1
+    # ESP32 retains completed downlinks through reset.  Never restart a CLI
+    # session at transaction 1, otherwise a new command can be mistaken for
+    # an old completed command still held in ESP32 NVS.
+    transaction_id: int = field(default_factory=lambda: secrets.randbelow(0xFFFFFFFF) + 1)
     print_lock: threading.Lock = field(default_factory=threading.Lock)
     stats_lock: threading.Lock = field(default_factory=threading.Lock)
     running: bool = True
@@ -294,13 +298,13 @@ def server_command(self: CliServer, line: str) -> bool:
     if name in {"quit", "exit"}:
         return False
     if name == "help":
-        self.output("Commands: stats | start ROBOT_ID | end ROBOT_ID | yellow ROBOT_ID | power_on ROBOT_ID | power_off ROBOT_ID | hp ROBOT_ID HP | status ROBOT_ID | assign ROBOT_ID CONTROLLER_MAC | quit")
+        self.output("Commands: stats | start ROBOT_ID | end ROBOT_ID | yellow ROBOT_ID | power_on ROBOT_ID | power_off ROBOT_ID | hp ROBOT_ID HP | status ROBOT_ID | assign ROBOT_ID CONTROLLER_MAC | controller ROBOT_ID CONTROLLER_MAC | quit")
         return True
     if name == "stats":
         self.output(self.summary())
         return True
     try:
-        if name == "assign" and len(parts) == 3:
+        if name in {"assign", "controller"} and len(parts) == 3:
             robot_id = int(parts[1])
             ip = self.robot_ip(robot_id)
             tx = self.next_transaction()

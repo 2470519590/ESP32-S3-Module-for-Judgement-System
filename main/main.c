@@ -96,6 +96,10 @@ typedef struct {
 typedef struct __attribute__((packed)) {
     uint8_t frame_type;
     uint8_t robot_id;
+    /* 0xFF means a locally generated test event.  Real L431 events retain
+     * their UART sequence so a retransmission cannot create another UDP
+     * transaction. */
+    uint8_t l431_sequence;
     uint32_t transaction_id;
 } persisted_reliable_event_t;
 
@@ -116,6 +120,19 @@ typedef struct __attribute__((packed)) {
 static completed_downlink_t s_completed_downlinks[4];
 
 static bool queue_event(robot_frame_type_t frame_type, uint16_t hp);
+static bool enqueue_reliable_event(robot_frame_type_t frame_type, uint8_t l431_sequence);
+
+static bool send_l431_event_ack(l431_event_t event, uint8_t sequence)
+{
+    uint8_t frame[4];
+    if (event == L431_EVENT_DEATH) frame[0] = 0xE3U;
+    else if (event == L431_EVENT_REVIVE) frame[0] = 0xE4U;
+    else return false;
+    frame[1] = (uint8_t)((frame[0] << 4U) | (frame[0] >> 4U));
+    frame[2] = sequence;
+    frame[3] = l431_link_crc8(frame, 3U);
+    return uart_write_bytes(UART_NUM_1, frame, sizeof(frame)) == sizeof(frame);
+}
 
 static robot_state_t s_state = {
     .hp = 200,
@@ -145,17 +162,25 @@ static void l431_on_status(const l431_status_t *status, void *context)
 
 static void l431_on_event(l431_event_t event, uint8_t sequence, void *context)
 {
-    (void)sequence;
+    bool accepted = false;
     (void)context;
     switch (event) {
-    case L431_EVENT_DEATH: (void)robot_network_publish_death(); break;
-    case L431_EVENT_REVIVE: (void)robot_network_publish_revive(); break;
+    /* Persist before acknowledging L431.  This prevents an ESP32 reset in
+     * the UART-to-UDP handoff window from losing a death/revive event. */
+    case L431_EVENT_DEATH:
+        accepted = enqueue_reliable_event(ROBOT_FRAME_DEATH, sequence);
+        break;
+    case L431_EVENT_REVIVE:
+        accepted = enqueue_reliable_event(ROBOT_FRAME_REVIVE, sequence);
+        break;
     case L431_EVENT_HIT: (void)robot_network_publish_hit(0); break;
     case L431_EVENT_ATTACK: (void)robot_network_publish_attack(); break;
     case L431_EVENT_SHOOT_ENABLED: (void)robot_network_publish_shoot_enabled(); break;
     case L431_EVENT_SHOOT_DISABLED: (void)robot_network_publish_shoot_disabled(); break;
     default: break;
     }
+    if (accepted && !send_l431_event_ack(event, sequence))
+        ESP_LOGW(TAG, "Cannot acknowledge L431 event 0x%02X seq=%u", event, sequence);
 }
 
 static void l431_on_ack(uint8_t command, uint32_t transaction_id,
@@ -252,15 +277,22 @@ static bool persist_reliable_events(void)
     return error == ESP_OK;
 }
 
-static bool enqueue_reliable_event(robot_frame_type_t frame_type)
+static bool enqueue_reliable_event(robot_frame_type_t frame_type, uint8_t l431_sequence)
 {
     bool queued = false;
     xSemaphoreTake(s_reliable_mutex, portMAX_DELAY);
     for (uint8_t index = 0; index < RELIABLE_EVENT_CAPACITY; ++index) {
         reliable_event_t *event = &s_reliable_events[index];
+        if (l431_sequence != 0xFFU &&
+            event->persisted.frame_type == (uint8_t)frame_type &&
+            event->persisted.l431_sequence == l431_sequence) {
+            queued = true;
+            break;
+        }
         if (event->persisted.frame_type == 0U) {
             event->persisted.frame_type = (uint8_t)frame_type;
             event->persisted.robot_id = s_robot_id;
+            event->persisted.l431_sequence = l431_sequence;
             event->persisted.transaction_id = esp_random();
             event->next_send_tick = 0;
             queued = persist_reliable_events();
@@ -646,84 +678,69 @@ static void robot_send_task(void *arg)
         .sin_addr.s_addr = inet_addr(USE_INTEGRATION_TEST_NETWORK ?
                                       TEST_SERVER_IP : CONFIG_ROBOT_SERVER_IP),
     };
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    int sock = -1;
     TickType_t last_status_tick = xTaskGetTickCount();
 
     while (true) {
         if (!(xEventGroupGetBits(s_events) & WIFI_CONNECTED_BIT)) {
+            if (sock >= 0) {
+                close(sock);
+                sock = -1;
+            }
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-        if (!CONFIG_ROBOT_TEST_MODE && (!s_l431_status_seen || s_robot_id == 0U)) {
+
+        /* Recreate the uplink socket after a Wi-Fi reconnect or a failed
+         * allocation.  A permanent invalid descriptor used to make uplink
+         * silently stop until a reset. */
+        if (sock < 0) {
+            sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+            if (sock < 0) {
+                ESP_LOGW(TAG, "Cannot create UDP uplink socket");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+        }
+
+        /* Do not make events depend on a current L431 status snapshot.  In
+         * particular, LINK_DOWN is produced precisely when that snapshot has
+         * timed out.  An identity is still mandatory because a server cannot
+         * attribute an event from robot 0. */
+        if (s_robot_id != 0U) {
+            pending_event_t event;
+            while (xQueueReceive(s_event_queue, &event, 0) == pdPASS) {
+                switch (event.frame_type) {
+                case ROBOT_FRAME_DEATH:
+                case ROBOT_FRAME_REVIVE:
+                    (void)enqueue_reliable_event(event.frame_type, 0xFFU);
+                    break;
+                case ROBOT_FRAME_HIT:
+                case ROBOT_FRAME_ATTACK:
+                case ROBOT_FRAME_SHOOT_ENABLED:
+                case ROBOT_FRAME_SHOOT_DISABLED:
+                case ROBOT_FRAME_REFEREE_LINK_DOWN:
+                case ROBOT_FRAME_REFEREE_LINK_UP: {
+                    robot_event_v2_frame_t frame = {ROBOT_PROTOCOL_MAGIC, ROBOT_PROTOCOL_VERSION,
+                        event.frame_type, s_robot_id};
+                    send_frame(sock, &server, &frame, sizeof(frame));
+                    break;
+                }
+                default:
+                    break;
+                }
+            }
+            service_reliable_events(sock, &server);
+        }
+
+        /* Only the periodic state frame needs a real L431 snapshot. */
+        if (!CONFIG_ROBOT_TEST_MODE && !s_l431_status_seen) {
             vTaskDelayUntil(&last_status_tick, pdMS_TO_TICKS(STATUS_PERIOD_MS));
             continue;
         }
 
-        robot_state_t state;
-        xSemaphoreTake(s_status_mutex, portMAX_DELAY);
-        state = s_state;
-        xSemaphoreGive(s_status_mutex);
-
-        robot_status_v2_frame_t status = {
-            .magic = ROBOT_PROTOCOL_MAGIC,
-            .version = ROBOT_PROTOCOL_VERSION,
-            .frame_type = ROBOT_FRAME_STATUS,
-            .robot_id = s_robot_id,
-            .hp = state.hp,
-            .heat = state.heat,
-            .power = state.power,
-            .alive = state.alive ? 1U : 0U,
-            .shoot_enabled = state.shoot_enabled ? 1U : 0U,
-            .power_on = state.power_on ? 1U : 0U,
-        };
-        send_frame(sock, &server, &status, sizeof(status));
-        service_reliable_events(sock, &server);
-
-        pending_event_t event;
-        while (xQueueReceive(s_event_queue, &event, 0) == pdPASS) {
-            switch (event.frame_type) {
-            case ROBOT_FRAME_DEATH: {
-                (void)enqueue_reliable_event(ROBOT_FRAME_DEATH);
-                break;
-            }
-            case ROBOT_FRAME_REVIVE: {
-                (void)enqueue_reliable_event(ROBOT_FRAME_REVIVE);
-                break;
-            }
-            case ROBOT_FRAME_HIT: {
-                robot_event_v2_frame_t frame = {ROBOT_PROTOCOL_MAGIC, ROBOT_PROTOCOL_VERSION,
-                    ROBOT_FRAME_HIT, s_robot_id};
-                send_frame(sock, &server, &frame, sizeof(frame));
-                break;
-            }
-            case ROBOT_FRAME_ATTACK: {
-                robot_event_v2_frame_t frame = {ROBOT_PROTOCOL_MAGIC, ROBOT_PROTOCOL_VERSION,
-                    ROBOT_FRAME_ATTACK, s_robot_id};
-                send_frame(sock, &server, &frame, sizeof(frame));
-                break;
-            }
-            case ROBOT_FRAME_SHOOT_ENABLED: {
-                robot_event_v2_frame_t frame = {ROBOT_PROTOCOL_MAGIC, ROBOT_PROTOCOL_VERSION,
-                    ROBOT_FRAME_SHOOT_ENABLED, s_robot_id};
-                send_frame(sock, &server, &frame, sizeof(frame));
-                break;
-            }
-            case ROBOT_FRAME_SHOOT_DISABLED: {
-                robot_event_v2_frame_t frame = {ROBOT_PROTOCOL_MAGIC, ROBOT_PROTOCOL_VERSION,
-                    ROBOT_FRAME_SHOOT_DISABLED, s_robot_id};
-                send_frame(sock, &server, &frame, sizeof(frame));
-                break;
-            }
-            case ROBOT_FRAME_REFEREE_LINK_DOWN:
-            case ROBOT_FRAME_REFEREE_LINK_UP: {
-                robot_event_v2_frame_t frame = {ROBOT_PROTOCOL_MAGIC, ROBOT_PROTOCOL_VERSION,
-                    event.frame_type, s_robot_id};
-                send_frame(sock, &server, &frame, sizeof(frame));
-                break;
-            }
-            default:
-                break;
-            }
+        if (s_robot_id != 0U) {
+            send_current_status(sock, &server);
         }
         vTaskDelayUntil(&last_status_tick, pdMS_TO_TICKS(STATUS_PERIOD_MS));
     }
