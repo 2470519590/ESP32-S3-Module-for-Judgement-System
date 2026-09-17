@@ -10,6 +10,9 @@ typedef struct {
     bool alive;
     bool shoot_enabled;
     bool power_on;
+    /* bit0=gun, bit1..4=armor NodeID 1..4; all armor bits are zero while
+     * the L431 automatic NodeID enumeration has not completed. */
+    uint8_t device_online_mask;
     uint8_t sequence;
 } l431_status_t;
 

@@ -3,7 +3,7 @@
 #include <string.h>
 
 static l431_link_callbacks_t s_callbacks;
-static uint8_t s_rx[11];
+static uint8_t s_rx[12];
 static uint8_t s_length;
 
 uint8_t l431_link_crc8(const uint8_t *data, uint8_t length)
@@ -46,7 +46,7 @@ void l431_link_feed(uint8_t byte)
         if (byte == second) s_rx[s_length++] = byte; else { s_length = 0; l431_link_feed(byte); }
         return;
     }
-    expected = (s_rx[0] == 0xA5U) ? 11U : ((s_rx[0] >= 0xB1U && s_rx[0] <= 0xB7U) ? 4U : 8U);
+    expected = (s_rx[0] == 0xA5U) ? 12U : ((s_rx[0] >= 0xB1U && s_rx[0] <= 0xB7U) ? 4U : 8U);
     s_rx[s_length++] = byte;
     if (s_length < expected) return;
     if (l431_link_crc8(s_rx, (uint8_t)(expected - 1U)) == s_rx[expected - 1U]) {
@@ -54,7 +54,8 @@ void l431_link_feed(uint8_t byte)
             l431_status_t status = {.sequence = s_rx[2], .alive = (s_rx[3] & 1U) != 0U,
                 .shoot_enabled = (s_rx[3] & 2U) != 0U, .power_on = (s_rx[3] & 4U) != 0U,
                 .hp = le16(&s_rx[4]),
-                .heat = le16(&s_rx[6]), .power = le16(&s_rx[8])};
+                .heat = le16(&s_rx[6]), .power = le16(&s_rx[8]),
+                .device_online_mask = s_rx[10]};
             s_callbacks.on_status(&status, s_callbacks.context);
         } else if (s_rx[0] >= 0xB1U && s_rx[0] <= 0xB7U && s_callbacks.on_event != NULL) {
             static const l431_event_t events[] = {L431_EVENT_ATTACK, L431_EVENT_HIT,

@@ -30,6 +30,7 @@ FRAME_SHOOT_DISABLED = 7
 FRAME_REFEREE_LINK_DOWN = 8
 FRAME_REFEREE_LINK_UP = 9
 FRAME_COMBAT_END = 11
+FRAME_DEVICE_HEALTH = 12
 FRAME_DEVICE_ANNOUNCE = 0x0A
 FRAME_GAME_START = 0x81
 FRAME_GAME_END = 0x82
@@ -88,6 +89,11 @@ def decode(data: bytes) -> str:
             _, _, _, robot, hp, heat, power, alive, shoot, power_on = struct.unpack("<HBBBHHHBBB", data)
             return (f"V2 STATUS robot={robot} hp={hp} heat={heat} power={power}W "
                     f"alive={alive} shoot={shoot} power={'ON' if power_on else 'OFF'}")
+        if frame_type == FRAME_DEVICE_HEALTH and len(data) == 6:
+            _, _, _, robot, online = struct.unpack("<HBBBB", data)
+            return (f"V2 HEALTH robot={robot} l431={'ON' if online & 0x01 else 'OFF'} "
+                    f"gun={'ON' if online & 0x02 else 'OFF'} "
+                    f"armor=[{' '.join('ON' if online & (1 << (node + 2)) else 'OFF' for node in range(4))}]")
         if frame_type == FRAME_ACK and len(data) == 10:
             _, _, _, acked_type, transaction_id, result = struct.unpack("<HBBBIB", data)
             return f"V2 ACK type=0x{acked_type:02X} tx={transaction_id} result={result}"
@@ -142,6 +148,7 @@ class CliServer:
     window_bad: int = 0
     event_counts: dict[int, int] = field(default_factory=dict)
     last_status: dict[int, tuple[int, int, int, int, int, int]] = field(default_factory=dict)
+    last_health: dict[int, int] = field(default_factory=dict)
     last_event: str = "-"
     ui_message: Callable[[str], None] | None = None
     robot_peers: dict[int, str] = field(default_factory=dict)
@@ -253,6 +260,12 @@ class CliServer:
                     self.robot_peers[robot] = peer[0]
                     self.window_status += 1
                     self.record_robot_packet(robot, frame_type, now)
+                elif frame_type == FRAME_DEVICE_HEALTH and len(data) == 6:
+                    _, _, _, robot, online = struct.unpack("<HBBBB", data)
+                    self.last_health[robot] = online
+                    self.robot_peers[robot] = peer[0]
+                    self.window_status += 1
+                    self.record_robot_packet(robot, frame_type, now)
                 elif frame_type == FRAME_ACK and len(data) == 10:
                     self.window_protocol_acks += 1
                     self.last_event = decode(data)
@@ -274,10 +287,10 @@ class CliServer:
             self.window_rx = self.window_status = self.window_events = self.window_bad = 0
             self.window_auto_acks = 0
             self.window_protocol_acks = 0
+            robots = sorted(set(self.last_status) | set(self.last_health))
             states = " ".join(
-                f"R{robot}:hp={hp} heat={heat} power={power}W alive={alive} shoot={shoot} "
-                f"pwr={'ON' if power_on else 'OFF'}"
-                for robot, (hp, heat, power, alive, shoot, power_on) in sorted(self.last_status.items())
+                self.format_robot_state(robot)
+                for robot in robots
             ) or "-"
             event_text = " ".join(f"{EVENT_NAMES.get(kind, f'0x{kind:02X}')}:{count}"
                                   for kind, count in sorted(self.event_counts.items())) or "-"
@@ -297,6 +310,15 @@ class CliServer:
                     f"udp_ack={protocol_acks:2d} bad={bad:2d}\n"
                     f"   per-robot net: {' | '.join(network) or '-'} | event_types={event_text}\n"
                     f"   {states} | last={self.last_event}")
+
+    def format_robot_state(self, robot: int) -> str:
+        status = self.last_status.get(robot)
+        health = self.last_health.get(robot, 0)
+        business = (f"hp={status[0]} heat={status[1]} power={status[2]}W alive={status[3]} "
+                    f"shoot={status[4]} pwr={'ON' if status[5] else 'OFF'}") if status else "business=NO_STATUS"
+        armor = "/".join("ON" if health & (1 << (node + 2)) else "OFF" for node in range(4))
+        return (f"R{robot}:{business} l431={'ON' if health & 0x01 else 'OFF'} "
+                f"gun={'ON' if health & 0x02 else 'OFF'} armor[1..4]={armor}")
 
     def summary_loop(self) -> None:
         while self.running:

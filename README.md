@@ -63,7 +63,15 @@ offset  size  field
 
 状态帧是发送端提供的当前机器人状态快照。服务器应直接读取其中的 `robot_id、hp、heat、power、alive、shoot_enabled、power_on`。`shoot_enabled` 是比赛射击许可；`power_on=1` 表示小车底盘供电输出已打开，`0` 表示已关闭。这两个字段互不推导。当前状态帧只定义这些业务字段，不包含额外的网络诊断字段、时间戳或 CRC；服务器可使用本地 UDP 接收时间统计报文间隔和丢包情况。
 
-### 3.2 独立事件帧
+### 3.2 设备健康帧：6 字节，约 10 Hz
+
+```text
+54 52 02 0C robot_id component_online
+```
+
+`component_online` 位图：bit0=L431PM，bit1=枪管，bit2~5=装甲板 NodeID 1~4。L431 每个 CAN 外设连续 1000 ms 未返回有效轮询回复即离线；四块装甲板尚未全部完成 NodeID 分配时，bit2~5 全部为 0。即使 CAN 回复仍在到达，装甲板仅在 `NORMAL` 或 `HIT` 状态时在线，其余状态不能正常上报受击。ESP32 连续 300 ms 未收到 L431 状态帧时清除全部位，因此服务器可区分“ESP32 仍在线、L431 已掉线”。该帧是状态快照，不需要 ACK。
+
+### 3.3 独立事件帧
 
 普通事件固定 5 字节：`54 52 02 type robot_id`。
 
@@ -85,7 +93,7 @@ offset  size  field
 
 其中 `type=0x02` 为死亡，`type=0x03` 为复活；`transaction_id` 为 little-endian `uint32`。服务器收到后必须回一个 ACK，且同一 `(robot_id, type, transaction_id)` 只能执行业务一次，但重复收到时仍要回 ACK。
 
-### 3.3 设备注册帧：25 字节，每 2 秒
+### 3.4 设备注册帧：25 字节，每 2 秒
 
 ```text
 54 52 02 0A robot_id esp32_wifi_mac[6] controller_ble_mac[6] event_queue_drops[4] udp_send_failures[4]
@@ -142,7 +150,7 @@ ACK 固定 10 字节：
 
 服务器可以按下面顺序直接开始：
 
-1. 绑定 `0.0.0.0:5005`，严格解析 25 字节设备注册帧、14 字节状态帧、5/9 字节事件帧和 10 字节 ACK。
+1. 绑定 `0.0.0.0:5005`，严格解析 25 字节设备注册帧、14 字节业务状态帧、6 字节设备健康帧、5/9 字节事件帧和 10 字节 ACK。
 2. 用 ESP32 Wi-Fi MAC 建立设备表，保存当前源 IP、手柄 MAC 与最后在线时间；再以已分配的 `robot_id` 建立比赛状态表。
 3. 对死亡/复活按事务号去重并回 ACK。
 4. 实现下行帧构造、ACK 等待和相同事务号重传。

@@ -99,6 +99,7 @@ typedef struct {
     bool alive;
     bool shoot_enabled;
     bool power_on;
+    uint8_t device_online_mask;
 } robot_state_t;
 
 typedef struct {
@@ -185,6 +186,7 @@ static void l431_on_status(const l431_status_t *status, void *context)
     s_state.alive = status->alive;
     s_state.shoot_enabled = status->shoot_enabled;
     s_state.power_on = status->power_on;
+    s_state.device_online_mask = status->device_online_mask;
     xSemaphoreGive(s_status_mutex);
     s_l431_status_seen = true;
     s_l431_last_status_tick = xTaskGetTickCount();
@@ -589,6 +591,26 @@ static void send_current_status(int sock, const struct sockaddr_in *server)
     send_frame(sock, server, &status, sizeof(status));
 }
 
+static void send_device_health(int sock, const struct sockaddr_in *server)
+{
+    robot_state_t state;
+    uint8_t component_online = 0U;
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    state = s_state;
+    xSemaphoreGive(s_status_mutex);
+    if (s_l431_link_up) {
+        component_online = (uint8_t)(0x01U | ((state.device_online_mask & 0x1FU) << 1U));
+    }
+    const robot_device_health_v2_frame_t health = {
+        .magic = ROBOT_PROTOCOL_MAGIC,
+        .version = ROBOT_PROTOCOL_VERSION,
+        .frame_type = ROBOT_FRAME_DEVICE_HEALTH,
+        .robot_id = robot_id_snapshot(),
+        .component_online = component_online,
+    };
+    send_frame(sock, server, &health, sizeof(health));
+}
+
 static bool send_device_announce(int sock, const struct sockaddr_in *server)
 {
     robot_device_announce_v2_frame_t announce = {
@@ -882,7 +904,14 @@ static void robot_send_task(void *arg)
             service_reliable_events(sock, &server);
         }
 
-        /* Only the periodic state frame needs a real L431 snapshot. */
+        if (robot_id != 0U) {
+            /* This remains available before L431 starts and after it drops,
+             * so the server can distinguish an ESP32 network heartbeat from
+             * a healthy referee chain. */
+            send_device_health(sock, &server);
+        }
+
+        /* Only the existing business state frame needs a real L431 snapshot. */
         if (!CONFIG_ROBOT_TEST_MODE && !s_l431_status_seen) {
             vTaskDelayUntil(&last_status_tick, pdMS_TO_TICKS(STATUS_PERIOD_MS));
             continue;
