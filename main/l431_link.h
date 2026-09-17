@@ -20,6 +20,7 @@ typedef enum {
     L431_EVENT_REVIVE = 0x03,
     L431_EVENT_SHOOT_ENABLED = 0x06,
     L431_EVENT_SHOOT_DISABLED = 0x07,
+    L431_EVENT_COMBAT_END = 0x0B,
 } l431_event_t;
 
 typedef void (*l431_status_callback_t)(const l431_status_t *status, void *context);

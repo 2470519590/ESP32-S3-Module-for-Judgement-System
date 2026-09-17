@@ -18,6 +18,8 @@ typedef enum {
     ROBOT_FRAME_SHOOT_DISABLED = 0x07,
     ROBOT_FRAME_REFEREE_LINK_DOWN = 0x08,
     ROBOT_FRAME_REFEREE_LINK_UP = 0x09,
+    ROBOT_FRAME_COMBAT_END = 0x0B,
+    ROBOT_FRAME_DEVICE_ANNOUNCE = 0x0A,
     ROBOT_FRAME_GAME_START = 0x81,
     ROBOT_FRAME_GAME_END = 0x82,
     ROBOT_FRAME_ASSIGNMENT = 0x83,
@@ -97,12 +99,27 @@ typedef struct __attribute__((packed)) {
     uint32_t transaction_id;
 } robot_force_power_on_v2_frame_t;
 
-/* Server -> ESP32, persistent robot and controller assignment. Size: 15 bytes. */
+/* ESP32 -> server device registry heartbeat. Size: 25 bytes.
+ * robot_id is zero until the server assigns this physical ESP32. */
 typedef struct __attribute__((packed)) {
     uint16_t magic;
     uint8_t version;
     uint8_t frame_type;
     uint8_t robot_id;
+    uint8_t device_mac[6];
+    uint8_t controller_mac[6]; /* all zero when no controller is assigned */
+    uint32_t event_queue_drops;
+    uint32_t udp_send_failures;
+} robot_device_announce_v2_frame_t;
+
+/* Server -> one explicitly identified ESP32. Size: 21 bytes.
+ * target_device_mac is the ESP32 Wi-Fi MAC announced above. */
+typedef struct __attribute__((packed)) {
+    uint16_t magic;
+    uint8_t version;
+    uint8_t frame_type;
+    uint8_t robot_id;
+    uint8_t target_device_mac[6];
     uint8_t controller_mac[6];
     uint32_t transaction_id;
 } robot_assignment_v2_frame_t;
@@ -135,12 +152,29 @@ typedef struct __attribute__((packed)) {
     uint8_t result; /* 0 success, 1 rejected, 2 failed */
 } robot_ack_v2_frame_t;
 
+/* V2 is a fixed-length binary protocol.  Keep the documented frame lengths
+ * enforced at build time; an accidental packing/layout change must never
+ * become a silent on-air protocol break. */
+_Static_assert(sizeof(robot_status_v2_frame_t) == 14U, "V2 status must be 14 bytes");
+_Static_assert(sizeof(robot_event_v2_frame_t) == 5U, "V2 event must be 5 bytes");
+_Static_assert(sizeof(robot_reliable_event_v2_frame_t) == 9U, "V2 reliable event must be 9 bytes");
+_Static_assert(sizeof(robot_game_control_v2_frame_t) == 9U, "V2 game command must be 9 bytes");
+_Static_assert(sizeof(robot_yellow_card_v2_frame_t) == 9U, "V2 yellow card must be 9 bytes");
+_Static_assert(sizeof(robot_force_power_off_v2_frame_t) == 9U, "V2 power-off must be 9 bytes");
+_Static_assert(sizeof(robot_force_power_on_v2_frame_t) == 9U, "V2 power-on must be 9 bytes");
+_Static_assert(sizeof(robot_device_announce_v2_frame_t) == 25U, "V2 announce must be 25 bytes");
+_Static_assert(sizeof(robot_assignment_v2_frame_t) == 21U, "V2 assignment must be 21 bytes");
+_Static_assert(sizeof(robot_status_request_v2_frame_t) == 5U, "V2 status request must be 5 bytes");
+_Static_assert(sizeof(robot_set_hp_v2_frame_t) == 11U, "V2 set HP must be 11 bytes");
+_Static_assert(sizeof(robot_ack_v2_frame_t) == 10U, "V2 ACK must be 10 bytes");
+
 /* Call these from normal FreeRTOS task context after obtaining data from L431. */
 void robot_network_set_status(uint16_t hp, bool alive, bool shoot_enabled);
 bool robot_network_publish_death(void);
 bool robot_network_publish_revive(void);
 bool robot_network_publish_hit(uint16_t hp);
 bool robot_network_publish_attack(void);
+bool robot_network_publish_combat_end(void);
 bool robot_network_publish_shoot_enabled(void);
 bool robot_network_publish_shoot_disabled(void);
 

@@ -29,6 +29,8 @@ FRAME_SHOOT_ENABLED = 6
 FRAME_SHOOT_DISABLED = 7
 FRAME_REFEREE_LINK_DOWN = 8
 FRAME_REFEREE_LINK_UP = 9
+FRAME_COMBAT_END = 11
+FRAME_DEVICE_ANNOUNCE = 0x0A
 FRAME_GAME_START = 0x81
 FRAME_GAME_END = 0x82
 FRAME_ASSIGNMENT = 0x83
@@ -43,7 +45,7 @@ EVENT_NAMES = {
     FRAME_DEATH: "DEATH", FRAME_REVIVE: "REVIVE", FRAME_HIT: "HIT",
     FRAME_ATTACK: "ATTACK", FRAME_SHOOT_ENABLED: "SHOOT_ON",
     FRAME_SHOOT_DISABLED: "SHOOT_OFF", FRAME_REFEREE_LINK_DOWN: "LINK_DOWN",
-    FRAME_REFEREE_LINK_UP: "LINK_UP",
+    FRAME_REFEREE_LINK_UP: "LINK_UP", FRAME_COMBAT_END: "COMBAT_END",
 }
 
 
@@ -52,6 +54,10 @@ def mac_bytes(text: str) -> bytes:
     if len(chunks) != 6:
         raise ValueError("MAC must be xx:xx:xx:xx:xx:xx")
     return bytes(int(chunk, 16) for chunk in chunks)
+
+
+def mac_text(value: bytes) -> str:
+    return ":".join(f"{byte:02X}" for byte in value)
 
 
 def decode(data: bytes) -> str:
@@ -73,6 +79,11 @@ def decode(data: bytes) -> str:
             return f"V1 EVENT type={frame_type} robot={robot} team={team}"
 
     if version == V2:
+        if frame_type == FRAME_DEVICE_ANNOUNCE and len(data) == 25:
+            _, _, _, robot, device, controller, drops, tx_errors = struct.unpack("<HBBB6s6sII", data)
+            return (f"V2 DEVICE robot={robot or '-'} esp={mac_text(device)} "
+                    f"controller={mac_text(controller) if any(controller) else '-'} "
+                    f"drops={drops} tx_errors={tx_errors}")
         if frame_type == FRAME_STATUS and len(data) == 14:
             _, _, _, robot, hp, heat, power, alive, shoot, power_on = struct.unpack("<HBBBHHHBBB", data)
             return (f"V2 STATUS robot={robot} hp={hp} heat={heat} power={power}W "
@@ -83,12 +94,33 @@ def decode(data: bytes) -> str:
         if frame_type in {FRAME_DEATH, FRAME_REVIVE} and len(data) == 9:
             _, _, _, robot, transaction_id = struct.unpack("<HBBBI", data)
             return f"V2 EVENT type={frame_type} robot={robot} tx={transaction_id}"
-        if frame_type in {FRAME_HIT, FRAME_ATTACK, FRAME_SHOOT_ENABLED, FRAME_SHOOT_DISABLED,
+        if frame_type in {FRAME_HIT, FRAME_ATTACK, FRAME_SHOOT_ENABLED, FRAME_SHOOT_DISABLED, FRAME_COMBAT_END,
                           FRAME_REFEREE_LINK_DOWN, FRAME_REFEREE_LINK_UP} and len(data) == 5:
             _, _, _, robot = struct.unpack("<HBBB", data)
             return f"V2 EVENT type={frame_type} robot={robot}"
 
     return f"unknown V{version} type=0x{frame_type:02X} ({len(data)} B): {data.hex(' ')}"
+
+
+@dataclass
+class DeviceEntry:
+    device_mac: str
+    robot_id: int
+    ip: str
+    controller_mac: str | None
+    event_queue_drops: int
+    udp_send_failures: int
+    last_seen: float
+
+
+@dataclass
+class RobotMetrics:
+    rx: int = 0
+    status: int = 0
+    events: int = 0
+    intervals: list[float] = field(default_factory=list)
+    last_rx_time: float | None = None
+    max_gap_ms: float = 0.0
 
 
 @dataclass
@@ -108,15 +140,13 @@ class CliServer:
     window_auto_acks: int = 0
     window_protocol_acks: int = 0
     window_bad: int = 0
-    window_intervals: list[float] = field(default_factory=list)
-    last_rx_time: float | None = None
-    max_gap_ms: float = 0.0
     event_counts: dict[int, int] = field(default_factory=dict)
     last_status: dict[int, tuple[int, int, int, int, int, int]] = field(default_factory=dict)
     last_event: str = "-"
     ui_message: Callable[[str], None] | None = None
     robot_peers: dict[int, str] = field(default_factory=dict)
-
+    devices: dict[str, DeviceEntry] = field(default_factory=dict)
+    metrics: dict[int, RobotMetrics] = field(default_factory=dict)
     def output(self, text: str) -> None:
         if self.ui_message is not None:
             self.ui_message(text)
@@ -134,10 +164,56 @@ class CliServer:
         self.output(f"TX {description} | {frame.hex(' ')}")
 
     def robot_ip(self, robot_id: int) -> str:
-        ip = self.robot_peers.get(robot_id)
-        if ip is None:
-            raise ValueError(f"robot {robot_id} has not sent a status frame")
-        return ip
+        now = time.time()
+        online = [entry for entry in self.devices.values()
+                  if entry.robot_id == robot_id and now - entry.last_seen <= 6.0]
+        if len(online) == 1:
+            return online[0].ip
+        if len(online) > 1:
+            macs = ", ".join(entry.device_mac for entry in online)
+            raise ValueError(f"robot {robot_id} has duplicate online ESP32 IDs: {macs}")
+        if robot_id in self.robot_peers:
+            raise ValueError(
+                f"robot {robot_id} is sending status but no DEVICE_ANNOUNCE; "
+                "flash the current ESP32 firmware, then wait up to 2 seconds")
+        raise ValueError(f"robot {robot_id} has no online ESP32 registration")
+
+    def next_unassigned_device(self) -> DeviceEntry:
+        now = time.time()
+        available = [entry for entry in self.devices.values()
+                     if entry.robot_id == 0 and now - entry.last_seen <= 6.0]
+        if len(available) == 1:
+            return available[0]
+        if not available:
+            raise ValueError("no online unassigned ESP32; use devices and power on the target board")
+        raise ValueError("multiple unassigned ESP32 devices; power on only the target board, then retry assign")
+
+    def device_table(self) -> str:
+        now = time.time()
+        rows = ["DEVICE REGISTRY: robot | ESP32 Wi-Fi MAC   | current IP       | controller BLE MAC | drops/txerr | seen"]
+        for entry in sorted(self.devices.values(),
+                            key=lambda item: (item.robot_id == 0, item.robot_id, item.device_mac)):
+            robot = "-" if entry.robot_id == 0 else str(entry.robot_id)
+            controller = entry.controller_mac or "-"
+            rows.append(f"{robot:>5} | {entry.device_mac:<16} | {entry.ip:<16} | "
+                        f"{controller:<18} | {entry.event_queue_drops:5d}/{entry.udp_send_failures:<5d} | "
+                        f"{now - entry.last_seen:4.1f}s")
+        return "\n".join(rows) if len(rows) > 1 else rows[0] + "\n(no ESP32 announcement received)"
+
+    def record_robot_packet(self, robot: int, frame_type: int, now: float) -> None:
+        if robot == 0:
+            return
+        metric = self.metrics.setdefault(robot, RobotMetrics())
+        metric.rx += 1
+        if frame_type == FRAME_STATUS:
+            metric.status += 1
+        else:
+            metric.events += 1
+        if metric.last_rx_time is not None:
+            gap_ms = (now - metric.last_rx_time) * 1000.0
+            metric.intervals.append(gap_ms)
+            metric.max_gap_ms = max(metric.max_gap_ms, gap_ms)
+        metric.last_rx_time = now
 
     def acknowledge_reliable_event(self, data: bytes, peer: tuple[str, int]) -> None:
         """ACK V2 death/revive immediately, so ESP32 retransmission can be tested."""
@@ -155,21 +231,28 @@ class CliServer:
 
     def record_packet(self, data: bytes, peer: tuple[str, int]) -> None:
         now = time.monotonic()
+        now_epoch = time.time()
         with self.stats_lock:
             self.window_rx += 1
-            if self.last_rx_time is not None:
-                gap_ms = (now - self.last_rx_time) * 1000.0
-                self.window_intervals.append(gap_ms)
-                self.max_gap_ms = max(self.max_gap_ms, gap_ms)
-            self.last_rx_time = now
             if len(data) >= 4 and data[:2] == struct.pack("<H", MAGIC) and data[2] == V2:
                 frame_type = data[3]
-                if frame_type == FRAME_STATUS and len(data) == 14:
+                if frame_type == FRAME_DEVICE_ANNOUNCE and len(data) == 25:
+                    _, _, _, robot, device, controller, drops, tx_errors = struct.unpack(
+                        "<HBBB6s6sII", data)
+                    device_key = mac_text(device)
+                    controller_text = mac_text(controller) if any(controller) else None
+                    entry = DeviceEntry(device_key, robot, peer[0], controller_text,
+                                        drops, tx_errors, now_epoch)
+                    self.devices[device_key] = entry
+                    if robot:
+                        self.robot_peers[robot] = peer[0]
+                elif frame_type == FRAME_STATUS and len(data) == 14:
                     _, _, _, robot, hp, heat, power, alive, shoot, power_on = struct.unpack(
                         "<HBBBHHHBBB", data)
                     self.last_status[robot] = (hp, heat, power, alive, shoot, power_on)
                     self.robot_peers[robot] = peer[0]
                     self.window_status += 1
+                    self.record_robot_packet(robot, frame_type, now)
                 elif frame_type == FRAME_ACK and len(data) == 10:
                     self.window_protocol_acks += 1
                     self.last_event = decode(data)
@@ -177,6 +260,8 @@ class CliServer:
                     self.window_events += 1
                     self.event_counts[frame_type] = self.event_counts.get(frame_type, 0) + 1
                     self.last_event = decode(data)
+                    if len(data) >= 5:
+                        self.record_robot_packet(data[4], frame_type, now)
             else:
                 self.window_bad += 1
 
@@ -189,13 +274,6 @@ class CliServer:
             self.window_rx = self.window_status = self.window_events = self.window_bad = 0
             self.window_auto_acks = 0
             self.window_protocol_acks = 0
-            intervals = self.window_intervals
-            self.window_intervals = []
-            avg_gap = sum(intervals) / len(intervals) if intervals else 0.0
-            jitter = ((sum((value - avg_gap) ** 2 for value in intervals) /
-                       len(intervals)) ** 0.5) if intervals else 0.0
-            max_gap = self.max_gap_ms
-            self.max_gap_ms = 0.0
             states = " ".join(
                 f"R{robot}:hp={hp} heat={heat} power={power}W alive={alive} shoot={shoot} "
                 f"pwr={'ON' if power_on else 'OFF'}"
@@ -204,10 +282,20 @@ class CliServer:
             event_text = " ".join(f"{EVENT_NAMES.get(kind, f'0x{kind:02X}')}:{count}"
                                   for kind, count in sorted(self.event_counts.items())) or "-"
             self.event_counts.clear()
+            network = []
+            for robot, metric in sorted(self.metrics.items()):
+                intervals = metric.intervals
+                metric.intervals = []
+                avg_gap = sum(intervals) / len(intervals) if intervals else 0.0
+                jitter = ((sum((value - avg_gap) ** 2 for value in intervals) /
+                           len(intervals)) ** 0.5) if intervals else 0.0
+                network.append(f"R{robot}:rx={metric.rx:2d} gap={avg_gap:5.1f}/"
+                               f"{jitter:4.1f}/{metric.max_gap_ms:5.1f}ms")
+                metric.rx = metric.status = metric.events = 0
+                metric.max_gap_ms = 0.0
             return (f"1s rx={rx:3d} status={status:3d} events={events:2d} ack={acks:2d} "
                     f"udp_ack={protocol_acks:2d} bad={bad:2d}\n"
-                    f"   net gap(avg/jitter/max)={avg_gap:5.1f}/{jitter:5.1f}/{max_gap:5.1f} ms "
-                    f"| event_types={event_text}\n"
+                    f"   per-robot net: {' | '.join(network) or '-'} | event_types={event_text}\n"
                     f"   {states} | last={self.last_event}")
 
     def summary_loop(self) -> None:
@@ -298,7 +386,10 @@ def server_command(self: CliServer, line: str) -> bool:
     if name in {"quit", "exit"}:
         return False
     if name == "help":
-        self.output("Commands: stats | start ROBOT_ID | end ROBOT_ID | yellow ROBOT_ID | power_on ROBOT_ID | power_off ROBOT_ID | hp ROBOT_ID HP | status ROBOT_ID | assign ROBOT_ID CONTROLLER_MAC | controller ROBOT_ID CONTROLLER_MAC | quit")
+        self.output("Commands: devices | stats | assign ROBOT_ID CONTROLLER_MAC | start/end/yellow/power_on/power_off/status ROBOT_ID | hp ROBOT_ID HP | quit")
+        return True
+    if name in {"devices", "device", "registry"}:
+        self.output(self.device_table())
         return True
     if name == "stats":
         self.output(self.summary())
@@ -306,13 +397,20 @@ def server_command(self: CliServer, line: str) -> bool:
     try:
         if name in {"assign", "controller"} and len(parts) == 3:
             robot_id = int(parts[1])
-            ip = self.robot_ip(robot_id)
+            entry = self.next_unassigned_device()
+            device = mac_bytes(entry.device_mac)
+            ip = entry.ip
             tx = self.next_transaction()
             if not 1 <= robot_id <= 255:
                 raise ValueError("robot ID must be 1..255")
-            frame = struct.pack("<HBBB6sI", MAGIC, V2, FRAME_ASSIGNMENT,
-                                robot_id, mac_bytes(parts[2]), tx)
-            self.send(ip, frame, f"ASSIGN robot={robot_id} controller={parts[2]} tx={tx}")
+            frame = struct.pack("<HBBB6s6sI", MAGIC, V2, FRAME_ASSIGNMENT,
+                                robot_id, device, mac_bytes(parts[2]), tx)
+            self.send(ip, frame, f"ASSIGN auto-esp={entry.device_mac} ip={ip} robot={robot_id} controller={parts[2]} tx={tx}")
+            # Keep the next command from choosing the same board while its
+            # persistent assignment ACK is in flight.  A later announce is
+            # authoritative and corrects this optimistic display if needed.
+            entry.robot_id = robot_id
+            entry.controller_mac = parts[2].upper()
         elif name in {"start", "end"} and len(parts) == 2:
             robot_id = int(parts[1])
             ip = self.robot_ip(robot_id)

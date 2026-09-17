@@ -13,3 +13,4 @@ bool xbox_ble_get_latest_report(uint8_t report[16], bool *connected,
 
 /* address is in the normal printed order: xx:xx:xx:xx:xx:xx. */
 bool xbox_ble_set_target_address(const uint8_t address[6]);
+void xbox_ble_get_target_address(uint8_t address[6]);

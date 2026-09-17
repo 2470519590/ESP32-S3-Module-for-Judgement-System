@@ -9,6 +9,7 @@
 #include "freertos/semphr.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_random.h"
 #include "esp_wifi.h"
@@ -43,9 +44,11 @@
 #define STATUS_PERIOD_MS 100U
 #define EVENT_QUEUE_LENGTH 16U
 #define DOWNLINK_BUFFER_SIZE 64U
+#define COMPLETED_DOWNLINK_CAPACITY 32U
 #define RELIABLE_EVENT_CAPACITY 4U
 #define RELIABLE_RETRY_MS 100U
 #define RELIABLE_RETRY_BACKOFF_MS 1000U
+#define DEVICE_ANNOUNCE_PERIOD_MS 2000U
 
 /* UART0 is the controller-facing port; UART1 is the L431PM link. */
 #define CONTROLLER_UART_TX_GPIO 43
@@ -54,24 +57,40 @@
 #define L431_UART_RX_GPIO 18
 #define UART_RX_BUFFER_SIZE 512
 
-/* Replace these with each robot's factory/programmed identity. */
-#define LOCAL_ROBOT_ID 1U
-
 static const char *TAG = "robot_net";
 static EventGroupHandle_t s_events;
 static SemaphoreHandle_t s_status_mutex;
 static QueueHandle_t s_event_queue;
 static QueueHandle_t s_l431_ack_queue;
+static QueueHandle_t s_downlink_queue;
 static SemaphoreHandle_t s_reliable_mutex;
+static SemaphoreHandle_t s_completed_mutex;
+static SemaphoreHandle_t s_identity_mutex;
 static volatile bool s_l431_status_seen;
 static volatile TickType_t s_l431_last_status_tick;
 static volatile uint8_t s_l431_valid_status_count;
 static volatile bool s_l431_link_up;
-/* The current real-data integration has one robot and uses ID 1 so UART
- * testing can start without a server assignment. Production Wi-Fi keeps the
- * previous rule: ID comes from the persisted server assignment. */
-static uint8_t s_robot_id = (CONFIG_ROBOT_TEST_MODE || USE_INTEGRATION_TEST_NETWORK) ?
-                            LOCAL_ROBOT_ID : 0U;
+/* A physical ESP32 is anonymous until the server assigns a robot ID to its
+ * factory Wi-Fi MAC.  This prevents two newly flashed boards from both
+ * claiming robot 1 on the same test network. */
+static uint8_t s_robot_id;
+static uint8_t s_device_mac[6];
+static uint8_t s_controller_mac[6];
+static bool s_controller_assigned;
+static volatile uint32_t s_event_queue_drops;
+static volatile uint32_t s_udp_send_failures;
+/* Set after an NVS assignment commit so the server's current device table is
+ * refreshed immediately instead of waiting for the next 2 s heartbeat. */
+static volatile bool s_device_announce_pending = true;
+
+static uint8_t robot_id_snapshot(void)
+{
+    uint8_t robot_id;
+    xSemaphoreTake(s_identity_mutex, portMAX_DELAY);
+    robot_id = s_robot_id;
+    xSemaphoreGive(s_identity_mutex);
+    return robot_id;
+}
 
 typedef struct {
     uint16_t hp;
@@ -92,6 +111,14 @@ typedef struct {
     uint32_t transaction_id;
     uint8_t result;
 } l431_ack_t;
+
+typedef struct {
+    uint8_t frame_type;
+    uint8_t l431_command;
+    uint16_t hp;
+    uint32_t transaction_id;
+    struct sockaddr_in peer;
+} downlink_command_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t frame_type;
@@ -117,10 +144,18 @@ typedef struct __attribute__((packed)) {
     uint8_t result;
 } completed_downlink_t;
 
-static completed_downlink_t s_completed_downlinks[4];
+static completed_downlink_t s_completed_downlinks[COMPLETED_DOWNLINK_CAPACITY];
+static uint8_t s_completed_downlink_next;
 
 static bool queue_event(robot_frame_type_t frame_type, uint16_t hp);
 static bool enqueue_reliable_event(robot_frame_type_t frame_type, uint8_t l431_sequence);
+static bool find_completed_downlink(uint8_t frame_type, uint32_t transaction_id,
+                                    uint8_t *result);
+static void remember_completed_downlink(uint8_t frame_type, uint32_t transaction_id,
+                                        uint8_t result);
+static void send_server_ack(int sock, const struct sockaddr_in *peer,
+                            uint8_t acked_type, uint32_t transaction_id,
+                            uint8_t result);
 
 static bool send_l431_event_ack(l431_event_t event, uint8_t sequence)
 {
@@ -156,7 +191,8 @@ static void l431_on_status(const l431_status_t *status, void *context)
     if (s_l431_valid_status_count < 3U) ++s_l431_valid_status_count;
     if (!s_l431_link_up && s_l431_valid_status_count >= 3U) {
         s_l431_link_up = true;
-        (void)queue_event(ROBOT_FRAME_REFEREE_LINK_UP, 0U);
+        if (robot_id_snapshot() != 0U)
+            (void)queue_event(ROBOT_FRAME_REFEREE_LINK_UP, 0U);
     }
 }
 
@@ -173,10 +209,21 @@ static void l431_on_event(l431_event_t event, uint8_t sequence, void *context)
     case L431_EVENT_REVIVE:
         accepted = enqueue_reliable_event(ROBOT_FRAME_REVIVE, sequence);
         break;
-    case L431_EVENT_HIT: (void)robot_network_publish_hit(0); break;
-    case L431_EVENT_ATTACK: (void)robot_network_publish_attack(); break;
-    case L431_EVENT_SHOOT_ENABLED: (void)robot_network_publish_shoot_enabled(); break;
-    case L431_EVENT_SHOOT_DISABLED: (void)robot_network_publish_shoot_disabled(); break;
+    case L431_EVENT_HIT:
+        if (robot_id_snapshot() != 0U) (void)robot_network_publish_hit(0);
+        break;
+    case L431_EVENT_ATTACK:
+        if (robot_id_snapshot() != 0U) (void)robot_network_publish_attack();
+        break;
+    case L431_EVENT_COMBAT_END:
+        if (robot_id_snapshot() != 0U) (void)robot_network_publish_combat_end();
+        break;
+    case L431_EVENT_SHOOT_ENABLED:
+        if (robot_id_snapshot() != 0U) (void)robot_network_publish_shoot_enabled();
+        break;
+    case L431_EVENT_SHOOT_DISABLED:
+        if (robot_id_snapshot() != 0U) (void)robot_network_publish_shoot_disabled();
+        break;
     default: break;
     }
     if (accepted && !send_l431_event_ack(event, sequence))
@@ -263,7 +310,11 @@ static bool queue_event(robot_frame_type_t frame_type, uint16_t hp)
         .frame_type = frame_type,
         .hp = hp,
     };
-    return xQueueSend(s_event_queue, &event, 0) == pdPASS;
+    if (xQueueSend(s_event_queue, &event, 0) == pdPASS) return true;
+    const uint32_t drops = ++s_event_queue_drops;
+    if (drops == 1U || (drops % 16U) == 0U)
+        ESP_LOGW(TAG, "Event queue full; %" PRIu32 " frames dropped", drops);
+    return false;
 }
 
 static bool persist_reliable_events(void)
@@ -280,6 +331,8 @@ static bool persist_reliable_events(void)
 static bool enqueue_reliable_event(robot_frame_type_t frame_type, uint8_t l431_sequence)
 {
     bool queued = false;
+    const uint8_t robot_id = robot_id_snapshot();
+    if (robot_id == 0U) return false;
     xSemaphoreTake(s_reliable_mutex, portMAX_DELAY);
     for (uint8_t index = 0; index < RELIABLE_EVENT_CAPACITY; ++index) {
         reliable_event_t *event = &s_reliable_events[index];
@@ -291,9 +344,11 @@ static bool enqueue_reliable_event(robot_frame_type_t frame_type, uint8_t l431_s
         }
         if (event->persisted.frame_type == 0U) {
             event->persisted.frame_type = (uint8_t)frame_type;
-            event->persisted.robot_id = s_robot_id;
+            event->persisted.robot_id = robot_id;
             event->persisted.l431_sequence = l431_sequence;
             event->persisted.transaction_id = esp_random();
+            if (event->persisted.transaction_id == 0U)
+                event->persisted.transaction_id = 1U;
             event->next_send_tick = 0;
             queued = persist_reliable_events();
             if (!queued) memset(event, 0, sizeof(*event));
@@ -322,6 +377,11 @@ bool robot_network_publish_hit(uint16_t hp)
 bool robot_network_publish_attack(void)
 {
     return queue_event(ROBOT_FRAME_ATTACK, 0);
+}
+
+bool robot_network_publish_combat_end(void)
+{
+    return queue_event(ROBOT_FRAME_COMBAT_END, 0);
 }
 
 bool robot_network_publish_shoot_enabled(void)
@@ -392,16 +452,22 @@ static void robot_test_task(void *arg)
 }
 #endif
 
-static void send_frame(int sock, const struct sockaddr_in *server,
+static bool send_frame(int sock, const struct sockaddr_in *server,
                        const void *frame, size_t frame_size)
 {
-    (void)sendto(sock, frame, frame_size, 0,
-                 (const struct sockaddr *)server, sizeof(*server));
+    const int sent = sendto(sock, frame, frame_size, 0,
+                            (const struct sockaddr *)server, sizeof(*server));
+    if (sent == (int)frame_size) return true;
+    const uint32_t failures = ++s_udp_send_failures;
+    if (failures == 1U || (failures % 16U) == 0U)
+        ESP_LOGW(TAG, "UDP send failures=%" PRIu32 " (last %d, expected %u)",
+                 failures, sent, (unsigned int)frame_size);
+    return false;
 }
 
 static bool downlink_targets_this_robot(uint8_t target_robot_id)
 {
-    return target_robot_id == 0U || target_robot_id == s_robot_id;
+    return target_robot_id != 0U && target_robot_id == robot_id_snapshot();
 }
 
 static uint8_t forward_l431_command(uint8_t command, uint32_t transaction_id,
@@ -443,6 +509,50 @@ static uint8_t forward_l431_command(uint8_t command, uint32_t transaction_id,
     return 2U;
 }
 
+static void downlink_command_task(void *arg)
+{
+    downlink_command_t work;
+    const int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    (void)arg;
+    if (sock < 0) {
+        ESP_LOGE(TAG, "Cannot create UDP command-ACK socket");
+        vTaskDelete(NULL);
+        return;
+    }
+    while (true) {
+        if (xQueueReceive(s_downlink_queue, &work, portMAX_DELAY) != pdPASS) continue;
+        uint8_t result;
+        if (!find_completed_downlink(work.frame_type, work.transaction_id, &result)) {
+            result = forward_l431_command(work.l431_command, work.transaction_id, work.hp);
+            if (result != 2U)
+                remember_completed_downlink(work.frame_type, work.transaction_id, result);
+        }
+        send_server_ack(sock, &work.peer, work.frame_type, work.transaction_id, result);
+    }
+}
+
+static void dispatch_l431_command(int sock, const struct sockaddr_in *peer,
+                                  uint8_t frame_type, uint8_t l431_command,
+                                  uint32_t transaction_id, uint16_t hp)
+{
+    uint8_t result;
+    if (find_completed_downlink(frame_type, transaction_id, &result)) {
+        send_server_ack(sock, peer, frame_type, transaction_id, result);
+        return;
+    }
+    const downlink_command_t work = {
+        .frame_type = frame_type,
+        .l431_command = l431_command,
+        .hp = hp,
+        .transaction_id = transaction_id,
+        .peer = *peer,
+    };
+    if (xQueueSend(s_downlink_queue, &work, 0) != pdPASS) {
+        ESP_LOGW(TAG, "Downlink command queue full; frame 0x%02X", frame_type);
+        send_server_ack(sock, peer, frame_type, transaction_id, 2U);
+    }
+}
+
 static void send_server_ack(int sock, const struct sockaddr_in *peer,
                             uint8_t acked_type, uint32_t transaction_id,
                             uint8_t result)
@@ -468,7 +578,7 @@ static void send_current_status(int sock, const struct sockaddr_in *server)
         .magic = ROBOT_PROTOCOL_MAGIC,
         .version = ROBOT_PROTOCOL_VERSION,
         .frame_type = ROBOT_FRAME_STATUS,
-        .robot_id = s_robot_id,
+        .robot_id = robot_id_snapshot(),
         .hp = state.hp,
         .heat = state.heat,
         .power = state.power,
@@ -479,39 +589,73 @@ static void send_current_status(int sock, const struct sockaddr_in *server)
     send_frame(sock, server, &status, sizeof(status));
 }
 
+static bool send_device_announce(int sock, const struct sockaddr_in *server)
+{
+    robot_device_announce_v2_frame_t announce = {
+        .magic = ROBOT_PROTOCOL_MAGIC,
+        .version = ROBOT_PROTOCOL_VERSION,
+        .frame_type = ROBOT_FRAME_DEVICE_ANNOUNCE,
+    };
+    xSemaphoreTake(s_identity_mutex, portMAX_DELAY);
+    announce.robot_id = s_robot_id;
+    if (s_controller_assigned) {
+        memcpy(announce.controller_mac, s_controller_mac,
+               sizeof(announce.controller_mac));
+    }
+    xSemaphoreGive(s_identity_mutex);
+    memcpy(announce.device_mac, s_device_mac, sizeof(announce.device_mac));
+    announce.event_queue_drops = s_event_queue_drops;
+    announce.udp_send_failures = s_udp_send_failures;
+    return send_frame(sock, server, &announce, sizeof(announce));
+}
+
 
 static uint8_t save_assignment(uint8_t robot_id, const uint8_t mac[6])
 {
     nvs_handle_t handle;
-    if (robot_id == 0U || !xbox_ble_set_target_address(mac)) return 2U;
+    bool all_zero = true;
+    for (uint8_t index = 0U; index < 6U; ++index)
+        if (mac[index] != 0U) all_zero = false;
+    if (robot_id == 0U || all_zero) return 2U;
     if (nvs_open("robot", NVS_READWRITE, &handle) != ESP_OK) return 2U;
     esp_err_t error = nvs_set_u8(handle, "robot_id", robot_id);
     if (error == ESP_OK) error = nvs_set_blob(handle, "xbox_mac", mac, 6U);
     if (error == ESP_OK) error = nvs_commit(handle);
     nvs_close(handle);
     if (error != ESP_OK) return 2U;
+    if (!xbox_ble_set_target_address(mac)) return 2U;
+    xSemaphoreTake(s_identity_mutex, portMAX_DELAY);
     s_robot_id = robot_id;
+    memcpy(s_controller_mac, mac, sizeof(s_controller_mac));
+    s_controller_assigned = true;
+    s_device_announce_pending = true;
+    xSemaphoreGive(s_identity_mutex);
     return 0U;
 }
 
 static bool find_completed_downlink(uint8_t frame_type, uint32_t transaction_id,
                                     uint8_t *result)
 {
-    for (uint8_t index = 0; index < 4U; ++index) {
+    xSemaphoreTake(s_completed_mutex, portMAX_DELAY);
+    for (uint8_t index = 0; index < COMPLETED_DOWNLINK_CAPACITY; ++index) {
         const completed_downlink_t *entry = &s_completed_downlinks[index];
         if (entry->frame_type == frame_type && entry->transaction_id == transaction_id) {
             *result = entry->result;
+            xSemaphoreGive(s_completed_mutex);
             return true;
         }
     }
+    xSemaphoreGive(s_completed_mutex);
     return false;
 }
 
 static void remember_completed_downlink(uint8_t frame_type, uint32_t transaction_id,
                                         uint8_t result)
 {
-    const uint8_t index = (uint8_t)(transaction_id % 4U);
+    xSemaphoreTake(s_completed_mutex, portMAX_DELAY);
+    const uint8_t index = s_completed_downlink_next;
     s_completed_downlinks[index] = (completed_downlink_t){frame_type, transaction_id, result};
+    s_completed_downlink_next = (uint8_t)((index + 1U) % COMPLETED_DOWNLINK_CAPACITY);
     nvs_handle_t handle;
     if (nvs_open("robot", NVS_READWRITE, &handle) == ESP_OK) {
         (void)nvs_set_blob(handle, "down_ack", s_completed_downlinks,
@@ -519,17 +663,24 @@ static void remember_completed_downlink(uint8_t frame_type, uint32_t transaction
         (void)nvs_commit(handle);
         nvs_close(handle);
     }
+    xSemaphoreGive(s_completed_mutex);
 }
 
 static void load_assignment(void)
 {
     nvs_handle_t handle;
+    uint8_t stored_robot_id;
     uint8_t mac[6];
     size_t mac_length = sizeof(mac);
     if (nvs_open("robot", NVS_READONLY, &handle) != ESP_OK) return;
-    if (nvs_get_u8(handle, "robot_id", &s_robot_id) == ESP_OK &&
+    if (nvs_get_u8(handle, "robot_id", &stored_robot_id) == ESP_OK &&
         nvs_get_blob(handle, "xbox_mac", mac, &mac_length) == ESP_OK && mac_length == sizeof(mac))
+    {
         (void)xbox_ble_set_target_address(mac);
+        s_robot_id = stored_robot_id;
+        memcpy(s_controller_mac, mac, sizeof(s_controller_mac));
+        s_controller_assigned = true;
+    }
     size_t pending_length = sizeof(s_reliable_events);
     if (nvs_get_blob(handle, "pending", s_reliable_events, &pending_length) == ESP_OK &&
         pending_length == sizeof(s_reliable_events)) {
@@ -544,12 +695,17 @@ static void load_assignment(void)
     if (nvs_get_blob(handle, "down_ack", s_completed_downlinks, &completed_length) != ESP_OK ||
         completed_length != sizeof(s_completed_downlinks))
         memset(s_completed_downlinks, 0, sizeof(s_completed_downlinks));
+    s_completed_downlink_next = 0U;
     nvs_close(handle);
 }
 
 static void handle_server_datagram(int sock, const uint8_t *data, size_t length,
                                    const struct sockaddr_in *peer)
 {
+    const in_addr_t expected_server_ip = inet_addr(USE_INTEGRATION_TEST_NETWORK ?
+                                                   TEST_SERVER_IP : CONFIG_ROBOT_SERVER_IP);
+    if (peer->sin_addr.s_addr != expected_server_ip ||
+        peer->sin_port != htons(CONFIG_ROBOT_SERVER_PORT)) return;
     if (length < 4U || data[0] != 0x54U || data[1] != 0x52U ||
         data[2] != ROBOT_PROTOCOL_VERSION) return;
 
@@ -568,6 +724,8 @@ static void handle_server_datagram(int sock, const uint8_t *data, size_t length,
     if (data[3] == ROBOT_FRAME_ASSIGNMENT && length == sizeof(robot_assignment_v2_frame_t)) {
         const robot_assignment_v2_frame_t *assignment = (const void *)data;
         uint8_t result;
+        if (memcmp(assignment->target_device_mac, s_device_mac,
+                   sizeof(s_device_mac)) != 0) return;
         if (!find_completed_downlink(assignment->frame_type, assignment->transaction_id, &result)) {
             result = save_assignment(assignment->robot_id, assignment->controller_mac);
             if (result != 2U) remember_completed_downlink(assignment->frame_type, assignment->transaction_id, result);
@@ -581,12 +739,8 @@ static void handle_server_datagram(int sock, const uint8_t *data, size_t length,
         const robot_game_control_v2_frame_t *command = (const void *)data;
         if (!downlink_targets_this_robot(command->target_robot_id)) return;
         const uint8_t l431_command = (command->frame_type == ROBOT_FRAME_GAME_START) ? 0xC1U : 0xC2U;
-        uint8_t result;
-        if (!find_completed_downlink(command->frame_type, command->transaction_id, &result)) {
-            result = forward_l431_command(l431_command, command->transaction_id, 0U);
-            if (result != 2U) remember_completed_downlink(command->frame_type, command->transaction_id, result);
-        }
-        send_server_ack(sock, peer, command->frame_type, command->transaction_id, result);
+        dispatch_l431_command(sock, peer, command->frame_type, l431_command,
+                              command->transaction_id, 0U);
         return;
     }
 
@@ -596,12 +750,8 @@ static void handle_server_datagram(int sock, const uint8_t *data, size_t length,
         /* A penalty is always for one explicitly identified robot. */
         if (command->target_robot_id == 0U ||
             !downlink_targets_this_robot(command->target_robot_id)) return;
-        uint8_t result;
-        if (!find_completed_downlink(command->frame_type, command->transaction_id, &result)) {
-            result = forward_l431_command(0xC4U, command->transaction_id, 0U);
-            if (result != 2U) remember_completed_downlink(command->frame_type, command->transaction_id, result);
-        }
-        send_server_ack(sock, peer, command->frame_type, command->transaction_id, result);
+        dispatch_l431_command(sock, peer, command->frame_type, 0xC4U,
+                              command->transaction_id, 0U);
         return;
     }
 
@@ -610,12 +760,8 @@ static void handle_server_datagram(int sock, const uint8_t *data, size_t length,
         const robot_force_power_off_v2_frame_t *command = (const void *)data;
         if (command->target_robot_id == 0U ||
             !downlink_targets_this_robot(command->target_robot_id)) return;
-        uint8_t result;
-        if (!find_completed_downlink(command->frame_type, command->transaction_id, &result)) {
-            result = forward_l431_command(0xC5U, command->transaction_id, 0U);
-            if (result != 2U) remember_completed_downlink(command->frame_type, command->transaction_id, result);
-        }
-        send_server_ack(sock, peer, command->frame_type, command->transaction_id, result);
+        dispatch_l431_command(sock, peer, command->frame_type, 0xC5U,
+                              command->transaction_id, 0U);
         return;
     }
 
@@ -624,24 +770,16 @@ static void handle_server_datagram(int sock, const uint8_t *data, size_t length,
         const robot_force_power_on_v2_frame_t *command = (const void *)data;
         if (command->target_robot_id == 0U ||
             !downlink_targets_this_robot(command->target_robot_id)) return;
-        uint8_t result;
-        if (!find_completed_downlink(command->frame_type, command->transaction_id, &result)) {
-            result = forward_l431_command(0xC6U, command->transaction_id, 0U);
-            if (result != 2U) remember_completed_downlink(command->frame_type, command->transaction_id, result);
-        }
-        send_server_ack(sock, peer, command->frame_type, command->transaction_id, result);
+        dispatch_l431_command(sock, peer, command->frame_type, 0xC6U,
+                              command->transaction_id, 0U);
         return;
     }
 
     if (data[3] == ROBOT_FRAME_SET_HP && length == sizeof(robot_set_hp_v2_frame_t)) {
         const robot_set_hp_v2_frame_t *command = (const void *)data;
         if (!downlink_targets_this_robot(command->target_robot_id) || command->hp > 300U) return;
-        uint8_t result;
-        if (!find_completed_downlink(command->frame_type, command->transaction_id, &result)) {
-            result = forward_l431_command(0xC3U, command->transaction_id, command->hp);
-            if (result != 2U) remember_completed_downlink(command->frame_type, command->transaction_id, result);
-        }
-        send_server_ack(sock, peer, command->frame_type, command->transaction_id, result);
+        dispatch_l431_command(sock, peer, command->frame_type, 0xC3U,
+                              command->transaction_id, command->hp);
     }
 }
 
@@ -680,6 +818,7 @@ static void robot_send_task(void *arg)
     };
     int sock = -1;
     TickType_t last_status_tick = xTaskGetTickCount();
+    TickType_t last_announce_tick = last_status_tick - pdMS_TO_TICKS(DEVICE_ANNOUNCE_PERIOD_MS);
 
     while (true) {
         if (!(xEventGroupGetBits(s_events) & WIFI_CONNECTED_BIT)) {
@@ -703,11 +842,20 @@ static void robot_send_task(void *arg)
             }
         }
 
+        if (s_device_announce_pending ||
+            (xTaskGetTickCount() - last_announce_tick) >=
+            pdMS_TO_TICKS(DEVICE_ANNOUNCE_PERIOD_MS)) {
+            if (send_device_announce(sock, &server))
+                s_device_announce_pending = false;
+            last_announce_tick = xTaskGetTickCount();
+        }
+
         /* Do not make events depend on a current L431 status snapshot.  In
          * particular, LINK_DOWN is produced precisely when that snapshot has
          * timed out.  An identity is still mandatory because a server cannot
          * attribute an event from robot 0. */
-        if (s_robot_id != 0U) {
+        const uint8_t robot_id = robot_id_snapshot();
+        if (robot_id != 0U) {
             pending_event_t event;
             while (xQueueReceive(s_event_queue, &event, 0) == pdPASS) {
                 switch (event.frame_type) {
@@ -717,12 +865,13 @@ static void robot_send_task(void *arg)
                     break;
                 case ROBOT_FRAME_HIT:
                 case ROBOT_FRAME_ATTACK:
+                case ROBOT_FRAME_COMBAT_END:
                 case ROBOT_FRAME_SHOOT_ENABLED:
                 case ROBOT_FRAME_SHOOT_DISABLED:
                 case ROBOT_FRAME_REFEREE_LINK_DOWN:
                 case ROBOT_FRAME_REFEREE_LINK_UP: {
                     robot_event_v2_frame_t frame = {ROBOT_PROTOCOL_MAGIC, ROBOT_PROTOCOL_VERSION,
-                        event.frame_type, s_robot_id};
+                        event.frame_type, robot_id};
                     send_frame(sock, &server, &frame, sizeof(frame));
                     break;
                 }
@@ -739,7 +888,7 @@ static void robot_send_task(void *arg)
             continue;
         }
 
-        if (s_robot_id != 0U) {
+        if (robot_id_snapshot() != 0U) {
             send_current_status(sock, &server);
         }
         vTaskDelayUntil(&last_status_tick, pdMS_TO_TICKS(STATUS_PERIOD_MS));
@@ -937,13 +1086,19 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     load_assignment();
+    ESP_ERROR_CHECK(esp_read_mac(s_device_mac, ESP_MAC_WIFI_STA));
 
     s_status_mutex = xSemaphoreCreateMutex();
     s_event_queue = xQueueCreate(EVENT_QUEUE_LENGTH, sizeof(pending_event_t));
     s_l431_ack_queue = xQueueCreate(4, sizeof(l431_ack_t));
+    s_downlink_queue = xQueueCreate(4, sizeof(downlink_command_t));
     s_reliable_mutex = xSemaphoreCreateMutex();
+    s_completed_mutex = xSemaphoreCreateMutex();
+    s_identity_mutex = xSemaphoreCreateMutex();
     configASSERT(s_status_mutex != NULL && s_event_queue != NULL &&
-                 s_l431_ack_queue != NULL && s_reliable_mutex != NULL);
+                 s_l431_ack_queue != NULL && s_downlink_queue != NULL &&
+                 s_reliable_mutex != NULL && s_completed_mutex != NULL &&
+                 s_identity_mutex != NULL);
 
     uart_reservation_start();
     l431_link_init(&(l431_link_callbacks_t){
@@ -960,6 +1115,7 @@ void app_main(void)
     wifi_start();
     xTaskCreate(robot_send_task, "robot_udp", 3072, NULL, 4, NULL);
     xTaskCreate(robot_receive_task, "robot_udp_rx", 3072, NULL, 4, NULL);
+    xTaskCreate(downlink_command_task, "robot_downlink", 3072, NULL, 4, NULL);
 #if CONFIG_ROBOT_TEST_MODE
     xTaskCreate(robot_test_task, "robot_test", 3072, NULL, 4, NULL);
     ESP_LOGI(TAG, "Simulated match-data test mode enabled");

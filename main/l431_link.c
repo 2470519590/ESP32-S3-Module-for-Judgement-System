@@ -46,7 +46,7 @@ void l431_link_feed(uint8_t byte)
         if (byte == second) s_rx[s_length++] = byte; else { s_length = 0; l431_link_feed(byte); }
         return;
     }
-    expected = (s_rx[0] == 0xA5U) ? 11U : ((s_rx[0] >= 0xB1U && s_rx[0] <= 0xB6U) ? 4U : 8U);
+    expected = (s_rx[0] == 0xA5U) ? 11U : ((s_rx[0] >= 0xB1U && s_rx[0] <= 0xB7U) ? 4U : 8U);
     s_rx[s_length++] = byte;
     if (s_length < expected) return;
     if (l431_link_crc8(s_rx, (uint8_t)(expected - 1U)) == s_rx[expected - 1U]) {
@@ -56,9 +56,10 @@ void l431_link_feed(uint8_t byte)
                 .hp = le16(&s_rx[4]),
                 .heat = le16(&s_rx[6]), .power = le16(&s_rx[8])};
             s_callbacks.on_status(&status, s_callbacks.context);
-        } else if (s_rx[0] >= 0xB1U && s_rx[0] <= 0xB6U && s_callbacks.on_event != NULL) {
+        } else if (s_rx[0] >= 0xB1U && s_rx[0] <= 0xB7U && s_callbacks.on_event != NULL) {
             static const l431_event_t events[] = {L431_EVENT_ATTACK, L431_EVENT_HIT,
-                L431_EVENT_DEATH, L431_EVENT_REVIVE, L431_EVENT_SHOOT_ENABLED, L431_EVENT_SHOOT_DISABLED};
+                L431_EVENT_DEATH, L431_EVENT_REVIVE, L431_EVENT_SHOOT_ENABLED, L431_EVENT_SHOOT_DISABLED,
+                L431_EVENT_COMBAT_END};
             s_callbacks.on_event(events[s_rx[0] - 0xB1U], s_rx[2], s_callbacks.context);
         } else if (s_callbacks.on_ack != NULL) {
             s_callbacks.on_ack((uint8_t)(s_rx[0] - 0x10U), le32(&s_rx[2]), s_rx[6], s_callbacks.context);

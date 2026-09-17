@@ -32,10 +32,11 @@ void ble_store_config_init(void);
 
 static const char *TAG = "xbox_ble";
 
-/* Native NimBLE stores BLE addresses least-significant byte first.
- * address.txt: 8d:23:ab:a5:3c:c9
- */
-static uint8_t s_xbox_address[6] = {0xc9, 0x3c, 0xa5, 0xab, 0x23, 0x8d};
+/* Native NimBLE stores BLE addresses least-significant byte first.  A fresh
+ * ESP32 has no target until the server persists an explicit assignment. */
+static uint8_t s_xbox_address[6];
+static bool s_target_assigned;
+static bool s_host_synced;
 
 static uint8_t s_own_addr_type;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -79,6 +80,7 @@ static void xbox_trace(const char *format, ...)
 
 static void xbox_scan(void)
 {
+    if (!s_target_assigned) return;
     const struct ble_gap_disc_params params = {
         .itvl = 0x0060,
         .window = 0x0060,
@@ -264,7 +266,8 @@ static int xbox_gap_event(struct ble_gap_event *event, void *arg)
     (void)arg;
     switch (event->type) {
     case BLE_GAP_EVENT_DISC:
-        if (memcmp(event->disc.addr.val, s_xbox_address, sizeof(s_xbox_address)) == 0) {
+        if (s_target_assigned &&
+            memcmp(event->disc.addr.val, s_xbox_address, sizeof(s_xbox_address)) == 0) {
             ESP_LOGI(TAG, "Xbox controller found; connecting");
             xbox_trace("xbox:found");
             xbox_connect(&event->disc.addr);
@@ -341,6 +344,7 @@ static void xbox_on_sync(void)
         xbox_trace("xbox:addr-fail %d", rc);
         return;
     }
+    s_host_synced = true;
     xbox_scan();
 }
 
@@ -378,8 +382,8 @@ void xbox_ble_start(void)
     ble_hs_cfg.sm_sc = 1;
     ble_store_config_init();
     nimble_port_freertos_init(xbox_host_task);
-    xbox_trace("xbox:start 8d:23:ab:a5:3c:c9");
-    ESP_LOGI(TAG, "Xbox BLE enabled for 8d:23:ab:a5:3c:c9");
+    xbox_trace("xbox:start awaiting-assignment");
+    ESP_LOGI(TAG, "Xbox BLE enabled; awaiting server controller assignment");
 }
 
 bool xbox_ble_set_target_address(const uint8_t address[6])
@@ -391,7 +395,21 @@ bool xbox_ble_set_target_address(const uint8_t address[6])
     if (all_zero) return false;
     for (uint8_t index = 0; index < 6U; ++index)
         s_xbox_address[5U - index] = address[index];
+    s_target_assigned = true;
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE)
         (void)ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    else if (s_host_synced)
+        xbox_scan();
     return true;
+}
+
+void xbox_ble_get_target_address(uint8_t address[6])
+{
+    if (address == NULL) return;
+    if (!s_target_assigned) {
+        memset(address, 0, 6U);
+        return;
+    }
+    for (uint8_t index = 0U; index < 6U; ++index)
+        address[index] = s_xbox_address[5U - index];
 }
