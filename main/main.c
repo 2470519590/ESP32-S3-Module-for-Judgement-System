@@ -170,11 +170,8 @@ static bool send_l431_event_ack(l431_event_t event, uint8_t sequence)
     return uart_write_bytes(UART_NUM_1, frame, sizeof(frame)) == sizeof(frame);
 }
 
-static robot_state_t s_state = {
-    .hp = 200,
-    .alive = true,
-    .shoot_enabled = true,
-};
+/* Fail closed: no L431PM state has been confirmed at ESP32 boot. */
+static robot_state_t s_state;
 
 static void l431_on_status(const l431_status_t *status, void *context)
 {
@@ -1079,10 +1076,22 @@ static void controller_uart_task(void *arg)
     (void)arg;
     while (true) {
         uint8_t report[16] = {0}; uint32_t age_ms = UINT32_MAX; bool connected = false;
-        const bool valid = xbox_ble_get_latest_report(report, &connected, &age_ms) && age_ms <= 100U;
+        robot_state_t state;
+        const bool report_fresh = xbox_ble_get_latest_report(report, &connected, &age_ms) && age_ms <= 100U;
+        xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+        state = s_state;
+        xSemaphoreGive(s_status_mutex);
+        /* Keep 100 Hz framing/sequence alive for the chassis parser.  Real
+         * controller values require a confirmed, fresh L431PM state; every
+         * boot/link-loss/death/end/forfeit/power-off path otherwise sends zero. */
+        const bool referee_ready = s_l431_link_up;
+        const bool control_allowed = report_fresh && referee_ready && state.alive &&
+                                     state.hp != 0U && state.shoot_enabled && state.power_on;
         controller_state_frame_t frame = {.magic0 = 0xC3U, .magic1 = 0x3CU,
-            .sequence = sequence++, .flags = (uint8_t)((connected ? 0x01U : 0U) | (valid ? 0x02U : 0U))};
-        if (valid) {
+            .sequence = sequence++,
+            .flags = (uint8_t)((connected ? 0x01U : 0U) |
+                               (report_fresh ? 0x02U : 0U))};
+        if (control_allowed) {
             frame.left_x = xbox_axis_to_i8(read_u16le(&report[0]));
             frame.left_y = xbox_axis_to_i8(read_u16le(&report[2]));
             frame.right_x = xbox_axis_to_i8(read_u16le(&report[4]));

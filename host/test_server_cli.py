@@ -320,6 +320,13 @@ class CliServer:
         return (f"R{robot}:{business} l431={'ON' if health & 0x01 else 'OFF'} "
                 f"gun={'ON' if health & 0x02 else 'OFF'} armor[1..4]={armor}")
 
+    def current_state_line(self) -> str:
+        """Current version of summary's existing third line; no counters reset."""
+        with self.stats_lock:
+            robots = sorted(set(self.last_status) | set(self.last_health))
+            states = " ".join(self.format_robot_state(robot) for robot in robots) or "-"
+            return f"   {states} | last={self.last_event}"
+
     def summary_loop(self) -> None:
         while self.running:
             time.sleep(1.0)
@@ -327,7 +334,7 @@ class CliServer:
                 self.output(self.summary())
 
 
-def run_prompt_toolkit_ui(server: CliServer) -> None:
+def run_prompt_toolkit_ui(server: CliServer, ui_refresh_hz: float) -> None:
     """Run a real split-pane terminal UI: live status above, normal input below."""
     from prompt_toolkit.application import Application
     from prompt_toolkit.key_binding import KeyBindings
@@ -346,12 +353,28 @@ def run_prompt_toolkit_ui(server: CliServer) -> None:
 
     server.ui_message = add_message
 
+    # UI needs to feel live at 10 Hz, but summary() consumes and resets the
+    # one-second packet counters.  Keep those two clocks separate.
+    last_summary = "Waiting for first 1-second statistics window..."
+    next_summary_at = 0.0
+
     def refresh() -> None:
+        nonlocal last_summary, next_summary_at
+        now = time.monotonic()
+        if now >= next_summary_at:
+            last_summary = server.summary()
+            next_summary_at = now + 1.0
         with lock:
             recent = "\n".join(messages)
-        live = server.summary()
+        # Preserve the original three-line layout.  Only replace its existing
+        # robot-state line with current data; do not add a duplicate live pane.
+        summary_lines = last_summary.splitlines()
+        if len(summary_lines) >= 3:
+            summary_lines[2] = server.current_state_line()
+        rendered_summary = "\n".join(summary_lines)
         status.text = ("ESP32/L431PM 正式 V2 联调 | 真实 L431PM 数据 | 测试 Wi-Fi\n"
-                       + live + ("\n\n" + recent if recent else ""))
+                       + rendered_summary
+                       + ("\n\n" + recent if recent else ""))
 
     bindings = KeyBindings()
 
@@ -376,7 +399,7 @@ def run_prompt_toolkit_ui(server: CliServer) -> None:
         ]), focused_element=command),
         key_bindings=bindings,
         full_screen=True,
-        refresh_interval=1.0,
+        refresh_interval=1.0 / ui_refresh_hz,
     )
     refresh()
     try:
@@ -384,7 +407,7 @@ def run_prompt_toolkit_ui(server: CliServer) -> None:
             # The task must be created after prompt_toolkit has started its
             # asyncio loop; creating it before app.run_async() raises
             # RuntimeError: no running event loop.
-            app.create_background_task(_refresh_task(app, refresh))
+            app.create_background_task(_refresh_task(app, refresh, ui_refresh_hz))
             await app.run_async()
 
         asyncio.run(run_application())
@@ -392,11 +415,11 @@ def run_prompt_toolkit_ui(server: CliServer) -> None:
         server.ui_message = None
 
 
-async def _refresh_task(app, refresh: Callable[[], None]) -> None:
+async def _refresh_task(app, refresh: Callable[[], None], ui_refresh_hz: float) -> None:
     while True:
         refresh()
         app.invalidate()
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(1.0 / ui_refresh_hz)
 
 
 def server_command(self: CliServer, line: str) -> bool:
@@ -499,6 +522,8 @@ def main() -> int:
     parser.add_argument("--robot-port", type=int, default=5006, help="ESP32 downlink UDP port")
     parser.add_argument("--watch", action="store_true",
                         help="print one receive summary per second; no interactive commands")
+    parser.add_argument("--ui-hz", type=float, default=10.0,
+                        help="interactive UI refresh rate in Hz (default: 10; statistics remain 1-second windows)")
     args = parser.parse_args()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -513,7 +538,9 @@ def main() -> int:
                 time.sleep(1.0)
                 server.output(server.summary())
         else:
-            run_prompt_toolkit_ui(server)
+            if not 1.0 <= args.ui_hz <= 30.0:
+                parser.error("--ui-hz must be between 1 and 30")
+            run_prompt_toolkit_ui(server, args.ui_hz)
     except (EOFError, KeyboardInterrupt):
         server.output("Stopping.")
     finally:
