@@ -38,7 +38,7 @@ void l431_link_init(const l431_link_callbacks_t *callbacks)
 void l431_link_feed(uint8_t byte)
 {
     uint8_t expected = 0;
-    if (s_length == 0U) { if (byte == 0xA5U || (byte >= 0xB1U && byte <= 0xB6U) || (byte >= 0xD1U && byte <= 0xD6U)) s_rx[s_length++] = byte; return; }
+    if (s_length == 0U) { if (byte == 0xA5U || (byte >= 0xB1U && byte <= 0xB7U) || (byte >= 0xD1U && byte <= 0xD6U)) s_rx[s_length++] = byte; return; }
     if (s_length == 1U) {
         const uint8_t first = s_rx[0];
         const uint8_t second = (first == 0xA5U) ? 0x5AU :

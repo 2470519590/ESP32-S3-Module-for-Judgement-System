@@ -38,10 +38,11 @@
 #define TEST_SERVER_IP "10.25.81.216"
 /* Current formal-business integration uses the temporary test network.
  * This selects only Wi-Fi/server endpoints; simulated data remains disabled. */
-#define USE_INTEGRATION_TEST_NETWORK 1
+#define USE_INTEGRATION_TEST_NETWORK 0
 
 #define WIFI_CONNECTED_BIT BIT0
 #define STATUS_PERIOD_MS 100U
+#define L431_LINK_TIMEOUT_MS 700U
 #define EVENT_QUEUE_LENGTH 16U
 #define DOWNLINK_BUFFER_SIZE 64U
 #define COMPLETED_DOWNLINK_CAPACITY 32U
@@ -70,6 +71,10 @@ static volatile bool s_l431_status_seen;
 static volatile TickType_t s_l431_last_status_tick;
 static volatile uint8_t s_l431_valid_status_count;
 static volatile bool s_l431_link_up;
+/* Controller input is blocked only by a confirmed death.  Link loss, the
+ * preparation state, disabled shooting, and power state must not disable
+ * driving input.  Keep the death state across a temporary L431 disconnect. */
+static volatile bool s_controller_death_blocked;
 /* A physical ESP32 is anonymous until the server assigns a robot ID to its
  * factory Wi-Fi MAC.  This prevents two newly flashed boards from both
  * claiming robot 1 on the same test network. */
@@ -185,6 +190,8 @@ static void l431_on_status(const l431_status_t *status, void *context)
     s_state.power_on = status->power_on;
     s_state.device_online_mask = status->device_online_mask;
     xSemaphoreGive(s_status_mutex);
+    if (status->alive) s_controller_death_blocked = false;
+    else s_controller_death_blocked = true;
     s_l431_status_seen = true;
     s_l431_last_status_tick = xTaskGetTickCount();
     if (s_l431_valid_status_count < 3U) ++s_l431_valid_status_count;
@@ -203,9 +210,11 @@ static void l431_on_event(l431_event_t event, uint8_t sequence, void *context)
     /* Persist before acknowledging L431.  This prevents an ESP32 reset in
      * the UART-to-UDP handoff window from losing a death/revive event. */
     case L431_EVENT_DEATH:
+        s_controller_death_blocked = true;
         accepted = enqueue_reliable_event(ROBOT_FRAME_DEATH, sequence);
         break;
     case L431_EVENT_REVIVE:
+        s_controller_death_blocked = false;
         accepted = enqueue_reliable_event(ROBOT_FRAME_REVIVE, sequence);
         break;
     case L431_EVENT_HIT:
@@ -258,7 +267,7 @@ static void __attribute__((unused)) l431_link_monitor_task(void *arg)
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(100));
         if (s_l431_link_up &&
-            (xTaskGetTickCount() - s_l431_last_status_tick) >= pdMS_TO_TICKS(300)) {
+            (xTaskGetTickCount() - s_l431_last_status_tick) >= pdMS_TO_TICKS(L431_LINK_TIMEOUT_MS)) {
             s_l431_link_up = false;
             s_l431_valid_status_count = 0U;
             s_l431_status_seen = false;
@@ -1076,17 +1085,11 @@ static void controller_uart_task(void *arg)
     (void)arg;
     while (true) {
         uint8_t report[16] = {0}; uint32_t age_ms = UINT32_MAX; bool connected = false;
-        robot_state_t state;
         const bool report_fresh = xbox_ble_get_latest_report(report, &connected, &age_ms) && age_ms <= 100U;
-        xSemaphoreTake(s_status_mutex, portMAX_DELAY);
-        state = s_state;
-        xSemaphoreGive(s_status_mutex);
-        /* Keep 100 Hz framing/sequence alive for the chassis parser.  Real
-         * controller values require a confirmed, fresh L431PM state; every
-         * boot/link-loss/death/end/forfeit/power-off path otherwise sends zero. */
-        const bool referee_ready = s_l431_link_up;
-        const bool control_allowed = report_fresh && referee_ready && state.alive &&
-                                     state.hp != 0U && state.shoot_enabled && state.power_on;
+        /* Keep 100 Hz framing/sequence alive for the chassis parser.  The
+         * only L431-derived lockout is death; preparation, link loss,
+         * shooting permission, and power state do not disable the controller. */
+        const bool control_allowed = report_fresh && !s_controller_death_blocked;
         controller_state_frame_t frame = {.magic0 = 0xC3U, .magic1 = 0x3CU,
             .sequence = sequence++,
             .flags = (uint8_t)((connected ? 0x01U : 0U) |
