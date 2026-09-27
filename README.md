@@ -179,11 +179,13 @@ CLI 界面上方显示实时状态，下方是可输入命令的输入框。首�
 help
 stats
 devices
-assign 1 8D:23:AB:A5:3C:C9
-hp 1 300
-yellow 1
-power_on 1
-power_off 1
+assign 2 B3:00:14:62:56:60
+也可以写成：`assign 2 b30014625660`
+旧板改编号时使用：`reassign 1 3 8D:23:AB:A5:3C:C9`
+hp 2 300
+yellow 2
+power_on 2
+power_off 2
 status 1
 start 1
 end 1
@@ -196,7 +198,13 @@ quit
 仅上电目标 ESP32 -> devices 确认它已注册 -> assign ROBOT_ID CONTROLLER_MAC -> 再执行 hp/start/end
 ```
 
-CLI 不要求输入 ESP32 MAC：它自动选择唯一在线的未分配设备，并将该设备注册帧中的 Wi-Fi MAC 同时写进 `assign` 帧作为防串台校验。若同时存在多台未分配 ESP32，CLI 会拒绝猜测；应只上电目标板后再执行 `assign`。配置成功后机器人 ID 与手柄 MAC 写入 NVS。若同一个机器人 ID 出现在多台在线 ESP32 上，CLI 会拒绝发送比赛命令，避免误控。
+CLI 不要求输入 ESP32 MAC：新设备会自动选择唯一在线的未分配设备，并将该设备注册帧中的 Wi-Fi MAC 同时写进 `assign` 帧作为防串台校验。若目标 RobotID 已在线，`assign` 会直接定位该 RobotID 对应的 ESP32，允许覆盖错误的手柄 MAC；因此设备误保存身份后可直接重新分配。若同时存在多台候选设备，CLI 会拒绝猜测。配置成功后机器人 ID 与手柄 MAC 写入 NVS。若同一个机器人 ID 出现在多台在线 ESP32 上，CLI 会拒绝发送比赛命令，避免误控。
+
+旧板已经保存了错误 RobotID 时，使用 `reassign OLD_ROBOT_ID NEW_ROBOT_ID CONTROLLER_MAC` 按当前 RobotID 精确定位设备并改号。例如把当前 RobotID=1 的旧板改为 3：
+
+```text
+reassign 1 3 8D:23:AB:A5:3C:C9
+```
 
 CLI 不保存本机设备登记文件，也不把电脑上的历史记录当作配置真源。CLI 重启后，等待已上电 ESP32 每 2 秒发送一次的 `DEVICE_ANNOUNCE` 自动重建当前在线表；该帧由 ESP32 从 NVS 读取自身保存的机器人 ID 与手柄 MAC。未重新上报的设备不会出现在表中，也不能接收下行命令。
 

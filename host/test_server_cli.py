@@ -51,10 +51,13 @@ EVENT_NAMES = {
 
 
 def mac_bytes(text: str) -> bytes:
-    chunks = text.replace("-", ":").split(":")
-    if len(chunks) != 6:
-        raise ValueError("MAC must be xx:xx:xx:xx:xx:xx")
-    return bytes(int(chunk, 16) for chunk in chunks)
+    compact = text.strip().replace(":", "").replace("-", "")
+    if len(compact) != 12:
+        raise ValueError("MAC must be xx:xx:xx:xx:xx:xx or 12 hex digits")
+    try:
+        return bytes.fromhex(compact)
+    except ValueError as exc:
+        raise ValueError("MAC must contain only hexadecimal digits") from exc
 
 
 def mac_text(value: bytes) -> str:
@@ -194,6 +197,24 @@ class CliServer:
         if not available:
             raise ValueError("no online unassigned ESP32; use devices and power on the target board")
         raise ValueError("multiple unassigned ESP32 devices; power on only the target board, then retry assign")
+
+    def assignment_target(self, robot_id: int) -> tuple[DeviceEntry, bool]:
+        """Prefer an online device already carrying robot_id for reassignment."""
+        assigned = self.online_robot_device(robot_id, "assignment")
+        if assigned is not None:
+            return assigned, True
+        return self.next_unassigned_device(), False
+
+    def online_robot_device(self, robot_id: int, action: str) -> DeviceEntry | None:
+        now = time.time()
+        assigned = [entry for entry in self.devices.values()
+                    if entry.robot_id == robot_id and now - entry.last_seen <= 6.0]
+        if len(assigned) == 1:
+            return assigned[0]
+        if len(assigned) > 1:
+            macs = ", ".join(entry.device_mac for entry in assigned)
+            raise ValueError(f"robot {robot_id} has duplicate online ESP32 IDs for {action}: {macs}")
+        return None
 
     def device_table(self) -> str:
         now = time.time()
@@ -431,7 +452,7 @@ def server_command(self: CliServer, line: str) -> bool:
     if name in {"quit", "exit"}:
         return False
     if name == "help":
-        self.output("Commands: devices | stats | assign ROBOT_ID CONTROLLER_MAC | start/end/yellow/power_on/power_off/status ROBOT_ID | hp ROBOT_ID HP | quit")
+        self.output("Commands: devices | stats | assign ROBOT_ID CONTROLLER_MAC | reassign OLD_ROBOT_ID NEW_ROBOT_ID CONTROLLER_MAC | start/end/yellow/power_on/power_off/status ROBOT_ID | hp ROBOT_ID HP | quit")
         return True
     if name in {"devices", "device", "registry"}:
         self.output(self.device_table())
@@ -440,22 +461,49 @@ def server_command(self: CliServer, line: str) -> bool:
         self.output(self.summary())
         return True
     try:
-        if name in {"assign", "controller"} and len(parts) == 3:
+        if name in {"reassign", "renumber"} and len(parts) == 4:
+            old_robot_id = int(parts[1])
+            new_robot_id = int(parts[2])
+            if not 1 <= old_robot_id <= 255 or not 1 <= new_robot_id <= 255:
+                raise ValueError("robot IDs must be 1..255")
+            if old_robot_id == new_robot_id:
+                raise ValueError("old and new robot IDs must differ")
+            entry = self.online_robot_device(old_robot_id, "reassign")
+            if entry is None:
+                raise ValueError(f"robot {old_robot_id} has no online ESP32 registration")
+            conflict = self.online_robot_device(new_robot_id, "reassign")
+            if conflict is not None and conflict.device_mac != entry.device_mac:
+                raise ValueError(f"robot {new_robot_id} is already assigned to ESP32 {conflict.device_mac}")
+            device = mac_bytes(entry.device_mac)
+            controller = mac_bytes(parts[3])
+            controller_text = mac_text(controller)
+            tx = self.next_transaction()
+            frame = struct.pack("<HBBB6s6sI", MAGIC, V2, FRAME_ASSIGNMENT,
+                                new_robot_id, device, controller, tx)
+            self.send(entry.ip, frame,
+                      f"REASSIGN esp={entry.device_mac} ip={entry.ip} "
+                      f"robot={old_robot_id}->{new_robot_id} controller={controller_text} tx={tx}")
+            entry.robot_id = new_robot_id
+            entry.controller_mac = controller_text
+        elif name in {"assign", "controller"} and len(parts) == 3:
             robot_id = int(parts[1])
-            entry = self.next_unassigned_device()
+            if not 1 <= robot_id <= 255:
+                raise ValueError("robot ID must be 1..255")
+            entry, is_reassignment = self.assignment_target(robot_id)
             device = mac_bytes(entry.device_mac)
             ip = entry.ip
             tx = self.next_transaction()
-            if not 1 <= robot_id <= 255:
-                raise ValueError("robot ID must be 1..255")
+            controller = mac_bytes(parts[2])
             frame = struct.pack("<HBBB6s6sI", MAGIC, V2, FRAME_ASSIGNMENT,
-                                robot_id, device, mac_bytes(parts[2]), tx)
-            self.send(ip, frame, f"ASSIGN auto-esp={entry.device_mac} ip={ip} robot={robot_id} controller={parts[2]} tx={tx}")
+                                robot_id, device, controller, tx)
+            controller_text = mac_text(controller)
+            mode = "reassign" if is_reassignment else "auto-esp"
+            self.send(ip, frame, f"ASSIGN {mode}={entry.device_mac} ip={ip} robot={robot_id} controller={controller_text} tx={tx}")
             # Keep the next command from choosing the same board while its
             # persistent assignment ACK is in flight.  A later announce is
             # authoritative and corrects this optimistic display if needed.
             entry.robot_id = robot_id
-            entry.controller_mac = parts[2].upper()
+            entry.controller_mac = controller_text
         elif name in {"start", "end"} and len(parts) == 2:
             robot_id = int(parts[1])
             ip = self.robot_ip(robot_id)

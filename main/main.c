@@ -35,9 +35,8 @@
 #ifndef CONFIG_ROBOT_TEST_MODE
 #define CONFIG_ROBOT_TEST_MODE 0
 #endif
-#define TEST_SERVER_IP "10.25.81.216"
-/* Current formal-business integration uses the temporary test network.
- * This selects only Wi-Fi/server endpoints; simulated data remains disabled. */
+#define TEST_SERVER_IP "10.77.244.216"
+/* Use the configured formal Wi-Fi and server endpoints. */
 #define USE_INTEGRATION_TEST_NETWORK 0
 
 #define WIFI_CONNECTED_BIT BIT0
