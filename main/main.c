@@ -15,6 +15,8 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "driver/rmt_encoder.h"
+#include "driver/rmt_tx.h"
 #include "driver/uart.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
@@ -36,8 +38,28 @@
 #define CONFIG_ROBOT_TEST_MODE 0
 #endif
 #define TEST_SERVER_IP "10.77.244.216"
-/* Use the configured formal Wi-Fi and server endpoints. */
-#define USE_INTEGRATION_TEST_NETWORK 0
+#ifndef CONFIG_ROBOT_THIRD_WIFI_SSID
+#define CONFIG_ROBOT_THIRD_WIFI_SSID ""
+#define CONFIG_ROBOT_THIRD_WIFI_PASSWORD ""
+#define CONFIG_ROBOT_THIRD_SERVER_IP "192.168.1.3"
+#endif
+static volatile uint8_t s_wifi_profile;
+static volatile int s_wifi_requested = -1;
+static volatile int s_wifi_l431_synced = -1;
+static volatile bool s_wifi_switching;
+static volatile bool s_wifi_connection_pending;
+static volatile bool s_wifi_profile_unconfigured;
+static volatile uint8_t s_wifi_previous_profile;
+static volatile TickType_t s_wifi_retry_due;
+static volatile TickType_t s_wifi_retry_deadline;
+static volatile bool s_wifi_selecting;
+static volatile uint8_t s_wifi_select_down_mod;
+static volatile uint8_t s_status_rgb_profile;
+static const char *server_ip_current(void)
+{
+    return s_wifi_profile == 0U ? CONFIG_ROBOT_SERVER_IP :
+        (s_wifi_profile == 1U ? TEST_SERVER_IP : CONFIG_ROBOT_THIRD_SERVER_IP);
+}
 
 #define WIFI_CONNECTED_BIT BIT0
 #define STATUS_PERIOD_MS 100U
@@ -56,8 +78,101 @@
 #define L431_UART_TX_GPIO 17
 #define L431_UART_RX_GPIO 18
 #define UART_RX_BUFFER_SIZE 512
+#define STATUS_RGB_GPIO 48
+#define STATUS_RGB_BRIGHTNESS 32U
 
 static const char *TAG = "robot_net";
+static SemaphoreHandle_t s_status_rgb_mutex;
+static rmt_channel_handle_t s_status_rgb_channel;
+static rmt_encoder_handle_t s_status_rgb_encoder;
+static uint8_t s_status_rgb_data[3];
+static uint16_t read_u16le(const uint8_t *data);
+static int8_t xbox_axis_to_i8(uint16_t value);
+
+static const uint8_t s_status_rgb_profile_colors[3][3] = {
+    {0U, 0U, STATUS_RGB_BRIGHTNESS},
+    {STATUS_RGB_BRIGHTNESS, STATUS_RGB_BRIGHTNESS, 0U},
+    {0U, STATUS_RGB_BRIGHTNESS, STATUS_RGB_BRIGHTNESS}, /* purple, GRB order */
+};
+
+static void status_rgb_init(void)
+{
+    const rmt_tx_channel_config_t channel_config = {
+        .gpio_num = STATUS_RGB_GPIO,
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 10000000U,
+        .mem_block_symbols = 64U,
+        .trans_queue_depth = 1U,
+    };
+    const rmt_bytes_encoder_config_t encoder_config = {
+        .bit0 = {.duration0 = 3U, .level0 = 1U, .duration1 = 9U, .level1 = 0U},
+        .bit1 = {.duration0 = 6U, .level0 = 1U, .duration1 = 6U, .level1 = 0U},
+        .flags = {.msb_first = 1U},
+    };
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&channel_config, &s_status_rgb_channel));
+    ESP_ERROR_CHECK(rmt_new_bytes_encoder(&encoder_config, &s_status_rgb_encoder));
+    ESP_ERROR_CHECK(rmt_enable(s_status_rgb_channel));
+}
+
+static void status_rgb_set_profile(uint8_t profile)
+{
+    if (profile > 2U) return;
+
+    /* The onboard LED accepts GRB bytes. Keep the level deliberately modest. */
+    s_status_rgb_profile = profile;
+    xSemaphoreTake(s_status_rgb_mutex, portMAX_DELAY);
+    memcpy(s_status_rgb_data, s_status_rgb_profile_colors[profile], sizeof(s_status_rgb_data));
+    ESP_ERROR_CHECK(rmt_tx_wait_all_done(s_status_rgb_channel, -1));
+    const rmt_transmit_config_t tx_config = {.loop_count = 0};
+    ESP_ERROR_CHECK(rmt_transmit(s_status_rgb_channel, s_status_rgb_encoder,
+                                 s_status_rgb_data, sizeof(s_status_rgb_data), &tx_config));
+    ESP_ERROR_CHECK(rmt_tx_wait_all_done(s_status_rgb_channel, -1));
+    xSemaphoreGive(s_status_rgb_mutex);
+}
+
+static void status_rgb_set_on(bool on)
+{
+    xSemaphoreTake(s_status_rgb_mutex, portMAX_DELAY);
+    const uint8_t profile = s_wifi_selecting ? s_wifi_select_down_mod : s_status_rgb_profile;
+    if (on) memcpy(s_status_rgb_data, s_status_rgb_profile_colors[profile],
+                   sizeof(s_status_rgb_data));
+    else memset(s_status_rgb_data, 0, sizeof(s_status_rgb_data));
+    ESP_ERROR_CHECK(rmt_tx_wait_all_done(s_status_rgb_channel, -1));
+    const rmt_transmit_config_t tx_config = {.loop_count = 0};
+    ESP_ERROR_CHECK(rmt_transmit(s_status_rgb_channel, s_status_rgb_encoder,
+                                 s_status_rgb_data, sizeof(s_status_rgb_data), &tx_config));
+    ESP_ERROR_CHECK(rmt_tx_wait_all_done(s_status_rgb_channel, -1));
+    xSemaphoreGive(s_status_rgb_mutex);
+}
+
+static void status_rgb_task(void *arg)
+{
+    bool previous_on = true;
+    bool previous_blinking = false;
+    TickType_t next_toggle = xTaskGetTickCount();
+    (void)arg;
+    while (true) {
+        const bool blinking = s_wifi_selecting || s_wifi_switching || s_wifi_connection_pending;
+        const TickType_t now = xTaskGetTickCount();
+        bool on = previous_on;
+        if (!blinking) {
+            on = true;
+            next_toggle = now + pdMS_TO_TICKS(250U);
+        } else if (!previous_blinking) {
+            on = false;
+            next_toggle = now + pdMS_TO_TICKS(250U);
+        } else if ((int32_t)(now - next_toggle) >= 0) {
+            on = !on;
+            next_toggle = now + pdMS_TO_TICKS(250U);
+        }
+        if (on != previous_on || blinking != previous_blinking) {
+            status_rgb_set_on(on);
+            previous_on = on;
+            previous_blinking = blinking;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50U));
+    }
+}
 static EventGroupHandle_t s_events;
 static SemaphoreHandle_t s_status_mutex;
 static QueueHandle_t s_event_queue;
@@ -153,6 +268,7 @@ static completed_downlink_t s_completed_downlinks[COMPLETED_DOWNLINK_CAPACITY];
 static uint8_t s_completed_downlink_next;
 
 static bool queue_event(robot_frame_type_t frame_type, uint16_t hp);
+static bool persist_reliable_events(void);
 static bool enqueue_reliable_event(robot_frame_type_t frame_type, uint8_t l431_sequence);
 static bool find_completed_downlink(uint8_t frame_type, uint32_t transaction_id,
                                     uint8_t *result);
@@ -167,6 +283,7 @@ static bool send_l431_event_ack(l431_event_t event, uint8_t sequence)
     uint8_t frame[4];
     if (event == L431_EVENT_DEATH) frame[0] = 0xE3U;
     else if (event == L431_EVENT_REVIVE) frame[0] = 0xE4U;
+    else if (event == L431_EVENT_REVIVE_REQUEST) frame[0] = 0xE8U;
     else return false;
     frame[1] = (uint8_t)((frame[0] << 4U) | (frame[0] >> 4U));
     frame[2] = sequence;
@@ -191,6 +308,17 @@ static void l431_on_status(const l431_status_t *status, void *context)
     xSemaphoreGive(s_status_mutex);
     if (status->alive) s_controller_death_blocked = false;
     else s_controller_death_blocked = true;
+    if (status->alive) {
+        bool removed = false;
+        xSemaphoreTake(s_reliable_mutex, portMAX_DELAY);
+        for (uint8_t i = 0; i < RELIABLE_EVENT_CAPACITY; ++i)
+            if (s_reliable_events[i].persisted.frame_type == ROBOT_FRAME_REVIVE_REQUEST) {
+                memset(&s_reliable_events[i], 0, sizeof(s_reliable_events[i]));
+                removed = true;
+            }
+        if (removed) (void)persist_reliable_events();
+        xSemaphoreGive(s_reliable_mutex);
+    }
     s_l431_status_seen = true;
     s_l431_last_status_tick = xTaskGetTickCount();
     if (s_l431_valid_status_count < 3U) ++s_l431_valid_status_count;
@@ -215,6 +343,9 @@ static void l431_on_event(l431_event_t event, uint8_t sequence, void *context)
     case L431_EVENT_REVIVE:
         s_controller_death_blocked = false;
         accepted = enqueue_reliable_event(ROBOT_FRAME_REVIVE, sequence);
+        break;
+    case L431_EVENT_REVIVE_REQUEST:
+        accepted = enqueue_reliable_event(ROBOT_FRAME_REVIVE_REQUEST, sequence);
         break;
     case L431_EVENT_HIT:
         if (robot_id_snapshot() != 0U) (void)robot_network_publish_hit(0);
@@ -287,6 +418,7 @@ void robot_network_on_server_datagram(
             reliable_event_t *event = &s_reliable_events[index];
             if (event->persisted.frame_type == ack->acked_frame_type &&
                 event->persisted.transaction_id == ack->transaction_id) {
+                if (ack->acked_frame_type == ROBOT_FRAME_REVIVE_REQUEST) break;
                 memset(event, 0, sizeof(*event));
                 nvs_handle_t handle;
                 if (nvs_open("robot", NVS_READWRITE, &handle) == ESP_OK) {
@@ -481,7 +613,7 @@ static uint8_t forward_l431_command(uint8_t command, uint32_t transaction_id,
                                     uint16_t hp)
 {
     uint8_t frame[9];
-    const uint8_t length = (command == 0xC3U) ? 9U : 7U;
+    const uint8_t length = (command == 0xC3U || command == 0xC7U || command == 0xC8U) ? 9U : 7U;
     l431_ack_t ack;
 
     /* Do not acknowledge a command as executed when the referee link is absent. */
@@ -493,7 +625,7 @@ static uint8_t forward_l431_command(uint8_t command, uint32_t transaction_id,
     frame[3] = (uint8_t)(transaction_id >> 8U);
     frame[4] = (uint8_t)(transaction_id >> 16U);
     frame[5] = (uint8_t)(transaction_id >> 24U);
-    if (command == 0xC3U) {
+    if (length == 9U) {
         frame[6] = (uint8_t)hp;
         frame[7] = (uint8_t)(hp >> 8U);
     }
@@ -529,10 +661,24 @@ static void downlink_command_task(void *arg)
     while (true) {
         if (xQueueReceive(s_downlink_queue, &work, portMAX_DELAY) != pdPASS) continue;
         uint8_t result;
+        if (work.frame_type == 0U) {
+            result = forward_l431_command(work.l431_command, work.transaction_id, work.hp);
+            if (result == 0U) s_wifi_l431_synced = work.hp;
+            continue;
+        }
         if (!find_completed_downlink(work.frame_type, work.transaction_id, &result)) {
             result = forward_l431_command(work.l431_command, work.transaction_id, work.hp);
             if (result != 2U)
                 remember_completed_downlink(work.frame_type, work.transaction_id, result);
+        }
+        if (work.frame_type == ROBOT_FRAME_REVIVE_APPROVE && result == 0U) {
+            xSemaphoreTake(s_reliable_mutex, portMAX_DELAY);
+            for (uint8_t i = 0; i < RELIABLE_EVENT_CAPACITY; ++i)
+                if (s_reliable_events[i].persisted.frame_type == ROBOT_FRAME_REVIVE_REQUEST &&
+                    s_reliable_events[i].persisted.transaction_id == work.transaction_id)
+                    memset(&s_reliable_events[i], 0, sizeof(s_reliable_events[i]));
+            (void)persist_reliable_events();
+            xSemaphoreGive(s_reliable_mutex);
         }
         send_server_ack(sock, &work.peer, work.frame_type, work.transaction_id, result);
     }
@@ -729,8 +875,7 @@ static void load_assignment(void)
 static void handle_server_datagram(int sock, const uint8_t *data, size_t length,
                                    const struct sockaddr_in *peer)
 {
-    const in_addr_t expected_server_ip = inet_addr(USE_INTEGRATION_TEST_NETWORK ?
-                                                   TEST_SERVER_IP : CONFIG_ROBOT_SERVER_IP);
+    const in_addr_t expected_server_ip = inet_addr(server_ip_current());
     if (peer->sin_addr.s_addr != expected_server_ip ||
         peer->sin_port != htons(CONFIG_ROBOT_SERVER_PORT)) return;
     if (length < 4U || data[0] != 0x54U || data[1] != 0x52U ||
@@ -738,6 +883,28 @@ static void handle_server_datagram(int sock, const uint8_t *data, size_t length,
 
     if (data[3] == ROBOT_FRAME_ACK) {
         robot_network_on_server_datagram(data, length);
+        return;
+    }
+
+    /* Approval includes the outstanding request's UART sequence and UDP tx.
+     * Match it before forwarding, so a delayed approval cannot revive a new death. */
+    if (data[3] == ROBOT_FRAME_REVIVE_APPROVE && length == 10U) {
+        if (!downlink_targets_this_robot(data[4])) return;
+        uint32_t request_tx;
+        memcpy(&request_tx, &data[6], sizeof(request_tx));
+        bool matched = false;
+        xSemaphoreTake(s_reliable_mutex, portMAX_DELAY);
+        for (uint8_t i = 0; i < RELIABLE_EVENT_CAPACITY; ++i) {
+            persisted_reliable_event_t *request = &s_reliable_events[i].persisted;
+            if (request->frame_type == ROBOT_FRAME_REVIVE_REQUEST &&
+                request->l431_sequence == data[5] && request->transaction_id == request_tx)
+                matched = true;
+        }
+        xSemaphoreGive(s_reliable_mutex);
+        uint8_t completed;
+        if (matched || find_completed_downlink(ROBOT_FRAME_REVIVE_APPROVE, request_tx, &completed))
+            dispatch_l431_command(sock, peer, ROBOT_FRAME_REVIVE_APPROVE, 0xC7U, request_tx, data[5]);
+        else send_server_ack(sock, peer, ROBOT_FRAME_REVIVE_APPROVE, request_tx, 1U);
         return;
     }
 
@@ -824,7 +991,13 @@ static void service_reliable_events(int sock, const struct sockaddr_in *server)
             .robot_id = event->persisted.robot_id,
             .transaction_id = event->persisted.transaction_id,
         };
-        send_frame(sock, server, &frame, sizeof(frame));
+        if (event->persisted.frame_type == ROBOT_FRAME_REVIVE_REQUEST) {
+            uint8_t request[10] = {0x54, 0x52, ROBOT_PROTOCOL_VERSION,
+                ROBOT_FRAME_REVIVE_REQUEST, event->persisted.robot_id,
+                event->persisted.l431_sequence};
+            memcpy(&request[6], &event->persisted.transaction_id, 4U);
+            send_frame(sock, server, request, sizeof(request));
+        } else send_frame(sock, server, &frame, sizeof(frame));
         ++event->attempts;
         event->next_send_tick = now + pdMS_TO_TICKS(
             event->attempts < 3U ? RELIABLE_RETRY_MS : RELIABLE_RETRY_BACKOFF_MS);
@@ -840,14 +1013,14 @@ static void robot_send_task(void *arg)
     struct sockaddr_in server = {
         .sin_family = AF_INET,
         .sin_port = htons(CONFIG_ROBOT_SERVER_PORT),
-        .sin_addr.s_addr = inet_addr(USE_INTEGRATION_TEST_NETWORK ?
-                                      TEST_SERVER_IP : CONFIG_ROBOT_SERVER_IP),
+        .sin_addr.s_addr = 0,
     };
     int sock = -1;
     TickType_t last_status_tick = xTaskGetTickCount();
     TickType_t last_announce_tick = last_status_tick - pdMS_TO_TICKS(DEVICE_ANNOUNCE_PERIOD_MS);
 
     while (true) {
+        server.sin_addr.s_addr = inet_addr(server_ip_current());
         if (!(xEventGroupGetBits(s_events) & WIFI_CONNECTED_BIT)) {
             if (sock >= 0) {
                 close(sock);
@@ -899,7 +1072,21 @@ static void robot_send_task(void *arg)
                 case ROBOT_FRAME_REFEREE_LINK_UP: {
                     robot_event_v2_frame_t frame = {ROBOT_PROTOCOL_MAGIC, ROBOT_PROTOCOL_VERSION,
                         event.frame_type, robot_id};
-                    send_frame(sock, &server, &frame, sizeof(frame));
+                    /* UDP send failure does not mean the server received the
+                     * frame. Put the event back so a transient Wi-Fi/socket
+                     * failure can be retried; the existing queue-drop counter
+                     * records the only remaining bounded-queue loss case. */
+                    if (!send_frame(sock, &server, &frame, sizeof(frame))) {
+                        /* Keep the failed event at the head and leave the
+                         * remaining events queued for the next network pass.
+                         * Do not spin on a permanently failed socket. */
+                        if (xQueueSendToFront(s_event_queue, &event, 0) != pdPASS) {
+                            const uint32_t drops = ++s_event_queue_drops;
+                            if (drops == 1U || (drops % 16U) == 0U)
+                                ESP_LOGW(TAG, "Event retry queue full; %" PRIu32 " frames dropped", drops);
+                        }
+                        break;
+                    }
                     break;
                 }
                 default:
@@ -971,8 +1158,7 @@ static void robot_receive_task(void *arg)
             socklen_t peer_length = sizeof(peer);
             const int received = recvfrom(sock, data, sizeof(data), 0,
                                           (struct sockaddr *)&peer, &peer_length);
-            const char *server_ip = USE_INTEGRATION_TEST_NETWORK ?
-                TEST_SERVER_IP : CONFIG_ROBOT_SERVER_IP;
+            const char *server_ip = server_ip_current();
             if (received > 0 && peer.sin_addr.s_addr == inet_addr(server_ip)) {
                 handle_server_datagram(sock, data, (size_t)received, &peer);
             }
@@ -989,9 +1175,17 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_events, WIFI_CONNECTED_BIT);
         ESP_LOGW(TAG, "Wi-Fi disconnected; reconnecting");
-        esp_wifi_connect();
+        if (!s_wifi_switching) {
+            esp_wifi_connect();
+            if (s_wifi_connection_pending)
+                s_wifi_retry_due = xTaskGetTickCount() + pdMS_TO_TICKS(1000U);
+        }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         xEventGroupSetBits(s_events, WIFI_CONNECTED_BIT);
+        if (s_wifi_connection_pending && !s_wifi_profile_unconfigured) {
+            s_wifi_connection_pending = false;
+            ESP_LOGI(TAG, "Wi-Fi target profile connected; target color retained");
+        }
         ESP_LOGI(TAG, "Wi-Fi connected; robot UDP enabled");
     }
 }
@@ -1019,15 +1213,168 @@ static void wifi_start(void)
                                                wifi_event_handler, NULL));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-#if USE_INTEGRATION_TEST_NETWORK
-    /* Real L431 data, but current integration network. */
-    wifi_set_station_config(CONFIG_ROBOT_TEST_FALLBACK_WIFI_SSID,
-                            CONFIG_ROBOT_TEST_FALLBACK_WIFI_PASSWORD);
-#else
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    s_wifi_profile = 0U;
     wifi_set_station_config(CONFIG_ROBOT_WIFI_SSID, CONFIG_ROBOT_WIFI_PASSWORD);
-#endif
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+static void wifi_profile_task(void *arg)
+{
+    TickType_t sync_due = 0;
+    (void)arg;
+    while (true) {
+        const char *ssids[] = {CONFIG_ROBOT_WIFI_SSID, CONFIG_ROBOT_TEST_FALLBACK_WIFI_SSID,
+                              CONFIG_ROBOT_THIRD_WIFI_SSID};
+        const char *passwords[] = {CONFIG_ROBOT_WIFI_PASSWORD, CONFIG_ROBOT_TEST_FALLBACK_WIFI_PASSWORD,
+                                  CONFIG_ROBOT_THIRD_WIFI_PASSWORD};
+        int requested = s_wifi_requested;
+        if (requested >= 0) {
+            s_wifi_requested = -1;
+            if (requested < 3 && ssids[requested][0] != '\0' && requested != s_wifi_profile) {
+                /* Publish the selected color before changing the network. */
+                status_rgb_set_profile((uint8_t)requested);
+                s_wifi_previous_profile = s_wifi_profile;
+                /* Stop suppresses the disconnect callback's automatic reconnect. */
+                s_wifi_switching = true;
+                ESP_ERROR_CHECK(esp_wifi_stop());
+                xEventGroupClearBits(s_events, WIFI_CONNECTED_BIT);
+                wifi_set_station_config(ssids[requested], passwords[requested]);
+                s_wifi_profile = (uint8_t)requested;
+                s_wifi_l431_synced = -1;
+                s_device_announce_pending = true;
+                s_wifi_connection_pending = true;
+                s_wifi_retry_due = xTaskGetTickCount();
+                s_wifi_retry_deadline = s_wifi_retry_due + pdMS_TO_TICKS(10000U);
+                ESP_ERROR_CHECK(esp_wifi_start());
+                s_wifi_switching = false;
+                ESP_LOGI(TAG, "Wi-Fi profile=%u SSID=%s", s_wifi_profile, ssids[requested]);
+            } else if (requested == 2 && ssids[2][0] == '\0') {
+                s_wifi_previous_profile = s_wifi_profile;
+                s_wifi_profile_unconfigured = true;
+                s_wifi_connection_pending = true;
+                s_wifi_retry_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(10000U);
+                status_rgb_set_profile((uint8_t)requested);
+                ESP_LOGW(TAG, "Third Wi-Fi profile has no SSID; keeping selection feedback for 10s without switching");
+            }
+        }
+        TickType_t now = xTaskGetTickCount();
+        if (s_wifi_connection_pending) {
+            if (!s_wifi_profile_unconfigured &&
+                (int32_t)(now - s_wifi_retry_due) >= 0 &&
+                !(xEventGroupGetBits(s_events) & WIFI_CONNECTED_BIT)) {
+                (void)esp_wifi_connect();
+                s_wifi_retry_due = now + pdMS_TO_TICKS(1000U);
+            }
+            const bool target_not_connected = s_wifi_profile_unconfigured ||
+                !(xEventGroupGetBits(s_events) & WIFI_CONNECTED_BIT);
+            if ((int32_t)(now - s_wifi_retry_deadline) >= 0 && target_not_connected) {
+                const uint8_t fallback = s_wifi_previous_profile;
+                if (s_wifi_profile_unconfigured)
+                    ESP_LOGW(TAG, "Wi-Fi profile=%u is unconfigured; restoring profile=%u indicator",
+                             s_wifi_profile, fallback);
+                else
+                    ESP_LOGW(TAG, "Wi-Fi profile=%u failed for 10s; reverting to profile=%u",
+                             s_wifi_profile, fallback);
+                s_wifi_connection_pending = false;
+                s_wifi_profile_unconfigured = false;
+                if (ssids[s_wifi_profile][0] == '\0') {
+                    status_rgb_set_profile(fallback);
+                    s_wifi_profile = fallback;
+                    s_wifi_l431_synced = -1;
+                    s_device_announce_pending = true;
+                    continue;
+                }
+                s_wifi_switching = true;
+                ESP_ERROR_CHECK(esp_wifi_stop());
+                xEventGroupClearBits(s_events, WIFI_CONNECTED_BIT);
+                wifi_set_station_config(ssids[fallback], passwords[fallback]);
+                s_wifi_profile = fallback;
+                s_wifi_l431_synced = -1;
+                s_device_announce_pending = true;
+                status_rgb_set_profile(fallback);
+                ESP_ERROR_CHECK(esp_wifi_start());
+                s_wifi_switching = false;
+            }
+        }
+        if (s_l431_status_seen && (int32_t)(now - sync_due) >= 0) {
+            /* Shared worker serializes UART commands and ACK consumption. */
+            downlink_command_t work = {.frame_type = 0, .l431_command = 0xC8U,
+                .hp = s_wifi_profile, .transaction_id = esp_random()};
+            (void)xQueueSend(s_downlink_queue, &work, 0);
+            sync_due = now + pdMS_TO_TICKS(s_wifi_l431_synced == s_wifi_profile ? 5000 : 1000);
+        }
+        if (!s_l431_status_seen) s_wifi_l431_synced = -1;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+static bool controller_selection_safe(const uint8_t report[16])
+{
+    /* A Wi-Fi gesture is accepted only while the controller has no movement,
+     * trigger, or button output that could be mistaken for a live command. */
+    return (report[12] == 0U || report[12] == 1U || report[12] == 5U) &&
+           xbox_axis_to_i8(read_u16le(&report[0])) == 0 &&
+           xbox_axis_to_i8(read_u16le(&report[2])) == 0 &&
+           xbox_axis_to_i8(read_u16le(&report[4])) == 0 &&
+           xbox_axis_to_i8(read_u16le(&report[6])) == 0 &&
+           (read_u16le(&report[8]) >> 2U) == 0U &&
+           (read_u16le(&report[10]) >> 2U) == 0U &&
+           report[13] == 0U && report[14] == 0U;
+}
+
+static void wifi_gesture(uint8_t dpad, bool fresh, bool controller_safe)
+{
+    static uint8_t previous, up_count, down_mod;
+    static bool selecting;
+    static TickType_t commit_due;
+    static bool commit_armed;
+    TickType_t now = xTaskGetTickCount();
+    if (!fresh) {
+        previous = 0; up_count = 0; selecting = false; commit_armed = false;
+        s_wifi_selecting = false;
+        s_wifi_select_down_mod = 0U;
+        return;
+    }
+    if (!controller_safe) {
+        previous = dpad;
+        up_count = 0U;
+        selecting = false;
+        commit_armed = false;
+        s_wifi_selecting = false;
+        s_wifi_select_down_mod = 0U;
+        return;
+    }
+    if (selecting && !commit_armed && dpad == 0U && previous != 0U) {
+        /* Keep the feedback pattern active for two complete 1.5 s cycles. */
+        commit_due = now + pdMS_TO_TICKS(3000U);
+        commit_armed = true;
+    }
+    if (selecting && commit_armed && (int32_t)(now - commit_due) >= 0) {
+        s_status_rgb_profile = down_mod;
+        s_wifi_requested = down_mod;
+        s_wifi_selecting = false;
+        up_count = 0U;
+        selecting = false;
+        commit_armed = false;
+    }
+    if (dpad != previous) {
+        if (!selecting && dpad == 1U) {
+            if (++up_count == 3U) {
+                selecting = true; down_mod = 0U;
+                commit_armed = false;
+                s_wifi_selecting = true;
+                s_wifi_select_down_mod = down_mod;
+            }
+        } else if (selecting && dpad == 5U) {
+            down_mod = (uint8_t)((down_mod + 1U) % 3U);
+            commit_armed = false;
+            s_wifi_select_down_mod = down_mod;
+        }
+        else if (!selecting && dpad != 0U) up_count = 0;
+    }
+    previous = dpad;
 }
 
 static void uart_start(uart_port_t uart_num, int tx_gpio, int rx_gpio, int baud_rate)
@@ -1085,6 +1432,7 @@ static void controller_uart_task(void *arg)
     while (true) {
         uint8_t report[16] = {0}; uint32_t age_ms = UINT32_MAX; bool connected = false;
         const bool report_fresh = xbox_ble_get_latest_report(report, &connected, &age_ms) && age_ms <= 100U;
+        wifi_gesture(report[12], report_fresh, controller_selection_safe(report));
         /* Keep 100 Hz framing/sequence alive for the chassis parser.  The
          * only L431-derived lockout is death; preparation, link loss,
          * shooting permission, and power state do not disable the controller. */
@@ -1129,18 +1477,20 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_read_mac(s_device_mac, ESP_MAC_WIFI_STA));
 
     s_status_mutex = xSemaphoreCreateMutex();
+    s_status_rgb_mutex = xSemaphoreCreateMutex();
     s_event_queue = xQueueCreate(EVENT_QUEUE_LENGTH, sizeof(pending_event_t));
     s_l431_ack_queue = xQueueCreate(4, sizeof(l431_ack_t));
     s_downlink_queue = xQueueCreate(4, sizeof(downlink_command_t));
     s_reliable_mutex = xSemaphoreCreateMutex();
     s_completed_mutex = xSemaphoreCreateMutex();
     s_identity_mutex = xSemaphoreCreateMutex();
-    configASSERT(s_status_mutex != NULL && s_event_queue != NULL &&
+    configASSERT(s_status_mutex != NULL && s_status_rgb_mutex != NULL && s_event_queue != NULL &&
                  s_l431_ack_queue != NULL && s_downlink_queue != NULL &&
                  s_reliable_mutex != NULL && s_completed_mutex != NULL &&
                  s_identity_mutex != NULL);
 
     uart_reservation_start();
+    status_rgb_init();
     l431_link_init(&(l431_link_callbacks_t){
         .on_status = l431_on_status,
         .on_event = l431_on_event,
@@ -1151,8 +1501,11 @@ void app_main(void)
     xTaskCreate(l431_link_monitor_task, "l431_link_mon", 2048, NULL, 4, NULL);
 #endif
     xbox_ble_start();
-    xTaskCreate(controller_uart_task, "controller_uart", 2048, NULL, 5, NULL);
     wifi_start();
+    status_rgb_set_profile(s_wifi_profile);
+    xTaskCreate(status_rgb_task, "status_rgb", 2048, NULL, 2, NULL);
+    xTaskCreate(controller_uart_task, "controller_uart", 2048, NULL, 5, NULL);
+    xTaskCreate(wifi_profile_task, "wifi_profile", 3072, NULL, 4, NULL);
     xTaskCreate(robot_send_task, "robot_udp", 3072, NULL, 4, NULL);
     xTaskCreate(robot_receive_task, "robot_udp_rx", 3072, NULL, 4, NULL);
     xTaskCreate(downlink_command_task, "robot_downlink", 3072, NULL, 4, NULL);

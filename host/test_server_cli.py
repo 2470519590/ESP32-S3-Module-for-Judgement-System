@@ -40,9 +40,12 @@ FRAME_SET_HP = 0x85
 FRAME_YELLOW_CARD = 0x86
 FRAME_FORCE_POWER_OFF = 0x87
 FRAME_FORCE_POWER_ON = 0x88
+FRAME_REVIVE_REQUEST = 0x0D
+FRAME_REVIVE_APPROVE = 0x89
 FRAME_ACK = 0xF0
 
 EVENT_NAMES = {
+    FRAME_REVIVE_REQUEST: "REVIVE_REQUEST",
     FRAME_DEATH: "DEATH", FRAME_REVIVE: "REVIVE", FRAME_HIT: "HIT",
     FRAME_ATTACK: "ATTACK", FRAME_SHOOT_ENABLED: "SHOOT_ON",
     FRAME_SHOOT_DISABLED: "SHOOT_OFF", FRAME_REFEREE_LINK_DOWN: "LINK_DOWN",
@@ -83,6 +86,9 @@ def decode(data: bytes) -> str:
             return f"V1 EVENT type={frame_type} robot={robot} team={team}"
 
     if version == V2:
+        if frame_type == FRAME_REVIVE_REQUEST and len(data) == 10:
+            _, _, _, robot, sequence, transaction_id = struct.unpack("<HBBBBI", data)
+            return f"V2 REVIVE_REQUEST robot={robot} seq={sequence} tx={transaction_id}"
         if frame_type == FRAME_DEVICE_ANNOUNCE and len(data) == 25:
             _, _, _, robot, device, controller, drops, tx_errors = struct.unpack("<HBBB6s6sII", data)
             return (f"V2 DEVICE robot={robot or '-'} esp={mac_text(device)} "
@@ -157,6 +163,7 @@ class CliServer:
     robot_peers: dict[int, str] = field(default_factory=dict)
     devices: dict[str, DeviceEntry] = field(default_factory=dict)
     metrics: dict[int, RobotMetrics] = field(default_factory=dict)
+    revive_requests: dict[int, tuple[int, int]] = field(default_factory=dict)
     def output(self, text: str) -> None:
         if self.ui_message is not None:
             self.ui_message(text)
@@ -290,6 +297,13 @@ class CliServer:
                 elif frame_type == FRAME_ACK and len(data) == 10:
                     self.window_protocol_acks += 1
                     self.last_event = decode(data)
+                elif frame_type == FRAME_REVIVE_REQUEST and len(data) == 10:
+                    _, _, _, robot, sequence, tx = struct.unpack("<HBBBBI", data)
+                    self.revive_requests[robot] = (sequence, tx)
+                    self.window_events += 1
+                    self.last_event = decode(data)
+                    self.event_counts[frame_type] = self.event_counts.get(frame_type, 0) + 1
+                    self.record_robot_packet(robot, frame_type, now)
                 elif frame_type != FRAME_STATUS:
                     self.window_events += 1
                     self.event_counts[frame_type] = self.event_counts.get(frame_type, 0) + 1
@@ -452,7 +466,7 @@ def server_command(self: CliServer, line: str) -> bool:
     if name in {"quit", "exit"}:
         return False
     if name == "help":
-        self.output("Commands: devices | stats | assign ROBOT_ID CONTROLLER_MAC | reassign OLD_ROBOT_ID NEW_ROBOT_ID CONTROLLER_MAC | start/end/yellow/power_on/power_off/status ROBOT_ID | hp ROBOT_ID HP | quit")
+        self.output("Commands: devices | stats | assign ROBOT_ID CONTROLLER_MAC | reassign OLD_ROBOT_ID NEW_ROBOT_ID CONTROLLER_MAC | revive ROBOT_ID | start/end/yellow/power_on/power_off/status ROBOT_ID | hp ROBOT_ID HP | quit")
         return True
     if name in {"devices", "device", "registry"}:
         self.output(self.device_table())
@@ -504,6 +518,14 @@ def server_command(self: CliServer, line: str) -> bool:
             # authoritative and corrects this optimistic display if needed.
             entry.robot_id = robot_id
             entry.controller_mac = controller_text
+        elif name == "revive" and len(parts) == 2:
+            robot_id = int(parts[1])
+            ip = self.robot_ip(robot_id)
+            if robot_id not in self.revive_requests:
+                raise ValueError("no pending revive request for this robot")
+            sequence, tx = self.revive_requests[robot_id]
+            frame = struct.pack("<HBBBBI", MAGIC, V2, FRAME_REVIVE_APPROVE, robot_id, sequence, tx)
+            self.send(ip, frame, f"REVIVE_APPROVE target={robot_id} seq={sequence} tx={tx}")
         elif name in {"start", "end"} and len(parts) == 2:
             robot_id = int(parts[1])
             ip = self.robot_ip(robot_id)

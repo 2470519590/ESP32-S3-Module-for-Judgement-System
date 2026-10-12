@@ -38,7 +38,7 @@ void l431_link_init(const l431_link_callbacks_t *callbacks)
 void l431_link_feed(uint8_t byte)
 {
     uint8_t expected = 0;
-    if (s_length == 0U) { if (byte == 0xA5U || (byte >= 0xB1U && byte <= 0xB7U) || (byte >= 0xD1U && byte <= 0xD6U)) s_rx[s_length++] = byte; return; }
+    if (s_length == 0U) { if (byte == 0xA5U || (byte >= 0xB1U && byte <= 0xB8U) || (byte >= 0xD1U && byte <= 0xD8U)) s_rx[s_length++] = byte; return; }
     if (s_length == 1U) {
         const uint8_t first = s_rx[0];
         const uint8_t second = (first == 0xA5U) ? 0x5AU :
@@ -46,7 +46,7 @@ void l431_link_feed(uint8_t byte)
         if (byte == second) s_rx[s_length++] = byte; else { s_length = 0; l431_link_feed(byte); }
         return;
     }
-    expected = (s_rx[0] == 0xA5U) ? 12U : ((s_rx[0] >= 0xB1U && s_rx[0] <= 0xB7U) ? 4U : 8U);
+    expected = (s_rx[0] == 0xA5U) ? 12U : ((s_rx[0] >= 0xB1U && s_rx[0] <= 0xB8U) ? 4U : 8U);
     s_rx[s_length++] = byte;
     if (s_length < expected) return;
     if (l431_link_crc8(s_rx, (uint8_t)(expected - 1U)) == s_rx[expected - 1U]) {
@@ -57,10 +57,10 @@ void l431_link_feed(uint8_t byte)
                 .heat = le16(&s_rx[6]), .power = le16(&s_rx[8]),
                 .device_online_mask = s_rx[10]};
             s_callbacks.on_status(&status, s_callbacks.context);
-        } else if (s_rx[0] >= 0xB1U && s_rx[0] <= 0xB7U && s_callbacks.on_event != NULL) {
+        } else if (s_rx[0] >= 0xB1U && s_rx[0] <= 0xB8U && s_callbacks.on_event != NULL) {
             static const l431_event_t events[] = {L431_EVENT_ATTACK, L431_EVENT_HIT,
                 L431_EVENT_DEATH, L431_EVENT_REVIVE, L431_EVENT_SHOOT_ENABLED, L431_EVENT_SHOOT_DISABLED,
-                L431_EVENT_COMBAT_END};
+                L431_EVENT_COMBAT_END, L431_EVENT_REVIVE_REQUEST};
             s_callbacks.on_event(events[s_rx[0] - 0xB1U], s_rx[2], s_callbacks.context);
         } else if (s_callbacks.on_ack != NULL) {
             s_callbacks.on_ack((uint8_t)(s_rx[0] - 0x10U), le32(&s_rx[2]), s_rx[6], s_callbacks.context);
