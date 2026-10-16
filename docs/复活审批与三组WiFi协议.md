@@ -46,18 +46,20 @@ N 次下箭头；上下箭头释放后 1 秒没有继续按动，就选择 N % 3
 
 | N % 3 | SSID | 枪管显示 |
 |---|---|---|
-| 0 | RM_GAME（正式 Kconfig） | 自动比赛灯效，CAN 0x233 命令 0x00 |
-| 1 | evil rats crazily squeak，密码 66666666 | 全灭，命令 0x1F |
-| 2 | 预留 | 全绿，命令 0x10，区别于红/蓝队色 |
+| 0 | GAME_1 | 自动比赛灯效，CAN 0x233 命令 0x00 |
+| 1 | GAME_2 | 全灭，命令 0x1F |
+| 2 | CHECKIN | 第三档灯效，命令 0x10 |
 
-例如上、上、上、下，释放等待 1 秒后选择 evil；三次下选择 RM_GAME。
-索引为 0/1/2，零次下也选择 RM_GAME。
-第三组通过 CONFIG_ROBOT_THIRD_WIFI_SSID / PASSWORD / SERVER_IP 配置。
+例如上、上、上、下，释放等待 1 秒后选择 GAME_2；三次下选择 GAME_1。
+索引为 0/1/2，零次下也选择 GAME_1。
+三档 Wi-Fi 共用原 RM_GAME 的密码和服务器地址；仅 SSID 不同，分别为
+`CONFIG_ROBOT_WIFI_SSID`、`CONFIG_ROBOT_GAME2_WIFI_SSID` 和
+`CONFIG_ROBOT_CHECKIN_WIFI_SSID`。
 SSID 为空时拒绝切换，保留当前网络和灯效。
 
-Wi-Fi 选择只保存在 RAM，每次 ESP32 重启默认 RM_GAME。
-切换网络后 UDP 目标与下行 IP 校验一起更新：RM 使用 CONFIG_ROBOT_SERVER_IP，
-evil 使用 main.c 的 TEST_SERVER_IP，第三组使用 CONFIG_ROBOT_THIRD_SERVER_IP。
+Wi-Fi 选择只保存在 RAM，每次 ESP32 重启默认 GAME_1。
+切换网络后 UDP 目标与下行 IP 校验保持为 `CONFIG_ROBOT_SERVER_IP`，三档均使用
+原 RM_GAME 的服务器地址和 UDP 端口。
 切换只改变网络和灯效，不改变准备/正式比赛状态。
 L431 无连接时网络切换照常执行，链路恢复后补发灯控档位。
 枪管无需升级，使用已有 0x233/0x234 协议。

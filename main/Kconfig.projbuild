@@ -1,8 +1,8 @@
 menu "Robot Wi-Fi"
 
 config ROBOT_WIFI_SSID
-    string "Wi-Fi SSID"
-    default "RM_GAME"
+    string "Wi-Fi profile 1 SSID"
+    default "GAME_1"
 
 config ROBOT_WIFI_PASSWORD
     string "Wi-Fi password"
@@ -40,29 +40,14 @@ config ROBOT_TEST_MODE
         asynchronous match event every 3 to 6 seconds. Disable before
         connecting the real referee system.
 
-config ROBOT_TEST_FALLBACK_WIFI_SSID
-    string "Test-only fallback Wi-Fi SSID"
-    default "evil rats crazily squeak"
+config ROBOT_GAME2_WIFI_SSID
+    string "Wi-Fi profile 2 SSID"
+    default "GAME_2"
     help
-        Runtime profile 1, selected by the controller gesture.
-        It does not enable simulated match data.
+        Runtime profile 2, selected by the controller gesture.
 
-config ROBOT_TEST_FALLBACK_WIFI_PASSWORD
-    string "Test-only fallback Wi-Fi password"
-    default "66666666"
-    help
-        Password for runtime Wi-Fi profile 1.
-
-config ROBOT_THIRD_WIFI_SSID
-    string "Third Wi-Fi SSID (empty disables profile)"
-    default ""
-
-config ROBOT_THIRD_WIFI_PASSWORD
-    string "Third Wi-Fi password"
-    default ""
-
-config ROBOT_THIRD_SERVER_IP
-    string "Third Wi-Fi server IPv4"
-    default "192.168.1.3"
+config ROBOT_CHECKIN_WIFI_SSID
+    string "Wi-Fi profile 3 SSID"
+    default "CHECKIN"
 
 endmenu

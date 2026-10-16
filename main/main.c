@@ -25,23 +25,15 @@
 #include "l431_link.h"
 #include "xbox_ble.h"
 
-/* Older generated sdkconfig files do not yet contain the test-only fallback
- * Kconfig entries. Keep this source buildable until the local ESP-IDF Python
- * environment is repaired and configuration can be regenerated. */
-#ifndef CONFIG_ROBOT_TEST_FALLBACK_WIFI_SSID
-#define CONFIG_ROBOT_TEST_FALLBACK_WIFI_SSID "evil rats crazily squeak"
-#endif
-#ifndef CONFIG_ROBOT_TEST_FALLBACK_WIFI_PASSWORD
-#define CONFIG_ROBOT_TEST_FALLBACK_WIFI_PASSWORD "66666666"
+/* Keep older generated sdkconfig files buildable while configuration is regenerated. */
+#ifndef CONFIG_ROBOT_GAME2_WIFI_SSID
+#define CONFIG_ROBOT_GAME2_WIFI_SSID "GAME_2"
 #endif
 #ifndef CONFIG_ROBOT_TEST_MODE
 #define CONFIG_ROBOT_TEST_MODE 0
 #endif
-#define TEST_SERVER_IP "10.77.244.216"
-#ifndef CONFIG_ROBOT_THIRD_WIFI_SSID
-#define CONFIG_ROBOT_THIRD_WIFI_SSID ""
-#define CONFIG_ROBOT_THIRD_WIFI_PASSWORD ""
-#define CONFIG_ROBOT_THIRD_SERVER_IP "192.168.1.3"
+#ifndef CONFIG_ROBOT_CHECKIN_WIFI_SSID
+#define CONFIG_ROBOT_CHECKIN_WIFI_SSID "CHECKIN"
 #endif
 static volatile uint8_t s_wifi_profile;
 static volatile int s_wifi_requested = -1;
@@ -57,8 +49,8 @@ static volatile uint8_t s_wifi_select_down_mod;
 static volatile uint8_t s_status_rgb_profile;
 static const char *server_ip_current(void)
 {
-    return s_wifi_profile == 0U ? CONFIG_ROBOT_SERVER_IP :
-        (s_wifi_profile == 1U ? TEST_SERVER_IP : CONFIG_ROBOT_THIRD_SERVER_IP);
+    (void)s_wifi_profile;
+    return CONFIG_ROBOT_SERVER_IP;
 }
 
 #define WIFI_CONNECTED_BIT BIT0
@@ -185,10 +177,12 @@ static volatile bool s_l431_status_seen;
 static volatile TickType_t s_l431_last_status_tick;
 static volatile uint8_t s_l431_valid_status_count;
 static volatile bool s_l431_link_up;
-/* Controller input is blocked only by a confirmed death.  Link loss, the
+/* L431-derived controller blocking only follows confirmed death. Link loss, the
  * preparation state, disabled shooting, and power state must not disable
  * driving input.  Keep the death state across a temporary L431 disconnect. */
 static volatile bool s_controller_death_blocked;
+/* Server power commands only gate controller output; never switch L431 MOS. */
+static volatile bool s_controller_soft_power_off;
 /* A physical ESP32 is anonymous until the server assigns a robot ID to its
  * factory Wi-Fi MAC.  This prevents two newly flashed boards from both
  * claiming robot 1 on the same test network. */
@@ -616,6 +610,9 @@ static uint8_t forward_l431_command(uint8_t command, uint32_t transaction_id,
     const uint8_t length = (command == 0xC3U || command == 0xC7U || command == 0xC8U) ? 9U : 7U;
     l431_ack_t ack;
 
+    /* Defense in depth: server control must never reach physical MOS commands. */
+    if (command == 0xC5U || command == 0xC6U) return 1U;
+
     /* Do not acknowledge a command as executed when the referee link is absent. */
     if (!s_l431_status_seen) return 2U;
 
@@ -667,7 +664,13 @@ static void downlink_command_task(void *arg)
             continue;
         }
         if (!find_completed_downlink(work.frame_type, work.transaction_id, &result)) {
-            result = forward_l431_command(work.l431_command, work.transaction_id, work.hp);
+            if (work.frame_type == ROBOT_FRAME_FORCE_POWER_OFF ||
+                work.frame_type == ROBOT_FRAME_FORCE_POWER_ON) {
+                s_controller_soft_power_off = work.frame_type == ROBOT_FRAME_FORCE_POWER_OFF;
+                result = 0U;
+            } else {
+                result = forward_l431_command(work.l431_command, work.transaction_id, work.hp);
+            }
             if (result != 2U)
                 remember_completed_downlink(work.frame_type, work.transaction_id, result);
         }
@@ -868,6 +871,12 @@ static void load_assignment(void)
     if (nvs_get_blob(handle, "down_ack", s_completed_downlinks, &completed_length) != ESP_OK ||
         completed_length != sizeof(s_completed_downlinks))
         memset(s_completed_downlinks, 0, sizeof(s_completed_downlinks));
+    /* Soft blocking is RAM-only. Old physical-power ACKs must not suppress it. */
+    for (uint8_t i = 0U; i < COMPLETED_DOWNLINK_CAPACITY; ++i) {
+        if (s_completed_downlinks[i].frame_type == ROBOT_FRAME_FORCE_POWER_OFF ||
+            s_completed_downlinks[i].frame_type == ROBOT_FRAME_FORCE_POWER_ON)
+            memset(&s_completed_downlinks[i], 0, sizeof(s_completed_downlinks[i]));
+    }
     s_completed_downlink_next = 0U;
     nvs_close(handle);
 }
@@ -954,7 +963,7 @@ static void handle_server_datagram(int sock, const uint8_t *data, size_t length,
         const robot_force_power_off_v2_frame_t *command = (const void *)data;
         if (command->target_robot_id == 0U ||
             !downlink_targets_this_robot(command->target_robot_id)) return;
-        dispatch_l431_command(sock, peer, command->frame_type, 0xC5U,
+        dispatch_l431_command(sock, peer, command->frame_type, 0U,
                               command->transaction_id, 0U);
         return;
     }
@@ -964,7 +973,7 @@ static void handle_server_datagram(int sock, const uint8_t *data, size_t length,
         const robot_force_power_on_v2_frame_t *command = (const void *)data;
         if (command->target_robot_id == 0U ||
             !downlink_targets_this_robot(command->target_robot_id)) return;
-        dispatch_l431_command(sock, peer, command->frame_type, 0xC6U,
+        dispatch_l431_command(sock, peer, command->frame_type, 0U,
                               command->transaction_id, 0U);
         return;
     }
@@ -1225,10 +1234,8 @@ static void wifi_profile_task(void *arg)
     TickType_t sync_due = 0;
     (void)arg;
     while (true) {
-        const char *ssids[] = {CONFIG_ROBOT_WIFI_SSID, CONFIG_ROBOT_TEST_FALLBACK_WIFI_SSID,
-                              CONFIG_ROBOT_THIRD_WIFI_SSID};
-        const char *passwords[] = {CONFIG_ROBOT_WIFI_PASSWORD, CONFIG_ROBOT_TEST_FALLBACK_WIFI_PASSWORD,
-                                  CONFIG_ROBOT_THIRD_WIFI_PASSWORD};
+        const char *ssids[] = {CONFIG_ROBOT_WIFI_SSID, CONFIG_ROBOT_GAME2_WIFI_SSID,
+                              CONFIG_ROBOT_CHECKIN_WIFI_SSID};
         int requested = s_wifi_requested;
         if (requested >= 0) {
             s_wifi_requested = -1;
@@ -1240,7 +1247,7 @@ static void wifi_profile_task(void *arg)
                 s_wifi_switching = true;
                 ESP_ERROR_CHECK(esp_wifi_stop());
                 xEventGroupClearBits(s_events, WIFI_CONNECTED_BIT);
-                wifi_set_station_config(ssids[requested], passwords[requested]);
+                wifi_set_station_config(ssids[requested], CONFIG_ROBOT_WIFI_PASSWORD);
                 s_wifi_profile = (uint8_t)requested;
                 s_wifi_l431_synced = -1;
                 s_device_announce_pending = true;
@@ -1256,7 +1263,7 @@ static void wifi_profile_task(void *arg)
                 s_wifi_connection_pending = true;
                 s_wifi_retry_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(10000U);
                 status_rgb_set_profile((uint8_t)requested);
-                ESP_LOGW(TAG, "Third Wi-Fi profile has no SSID; keeping selection feedback for 10s without switching");
+                ESP_LOGW(TAG, "CHECKIN Wi-Fi profile has no SSID; keeping selection feedback for 10s without switching");
             }
         }
         TickType_t now = xTaskGetTickCount();
@@ -1289,7 +1296,7 @@ static void wifi_profile_task(void *arg)
                 s_wifi_switching = true;
                 ESP_ERROR_CHECK(esp_wifi_stop());
                 xEventGroupClearBits(s_events, WIFI_CONNECTED_BIT);
-                wifi_set_station_config(ssids[fallback], passwords[fallback]);
+                wifi_set_station_config(ssids[fallback], CONFIG_ROBOT_WIFI_PASSWORD);
                 s_wifi_profile = fallback;
                 s_wifi_l431_synced = -1;
                 s_device_announce_pending = true;
@@ -1435,8 +1442,10 @@ static void controller_uart_task(void *arg)
         wifi_gesture(report[12], report_fresh, controller_selection_safe(report));
         /* Keep 100 Hz framing/sequence alive for the chassis parser.  The
          * only L431-derived lockout is death; preparation, link loss,
-         * shooting permission, and power state do not disable the controller. */
-        const bool control_allowed = report_fresh && !s_controller_death_blocked;
+         * shooting permission, and physical power state do not disable input.
+         * Server soft-power lockout is independent of the death state. */
+        const bool control_allowed = report_fresh && !s_controller_death_blocked &&
+                                     !s_controller_soft_power_off;
         controller_state_frame_t frame = {.magic0 = 0xC3U, .magic1 = 0x3CU,
             .sequence = sequence++,
             .flags = (uint8_t)((connected ? 0x01U : 0U) |
