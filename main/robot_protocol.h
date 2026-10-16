@@ -21,6 +21,8 @@ typedef enum {
     ROBOT_FRAME_COMBAT_END = 0x0B,
     ROBOT_FRAME_DEVICE_HEALTH = 0x0C,
     ROBOT_FRAME_REVIVE_REQUEST = 0x0D,
+    ROBOT_FRAME_MOTION = 0x0E,
+    ROBOT_FRAME_ARMOR_THRESHOLD_STATE = 0x0F,
     ROBOT_FRAME_DEVICE_ANNOUNCE = 0x0A,
     ROBOT_FRAME_GAME_START = 0x81,
     ROBOT_FRAME_GAME_END = 0x82,
@@ -31,6 +33,7 @@ typedef enum {
     ROBOT_FRAME_FORCE_POWER_OFF = 0x87,
     ROBOT_FRAME_FORCE_POWER_ON = 0x88,
     ROBOT_FRAME_REVIVE_APPROVE = 0x89,
+    ROBOT_FRAME_ARMOR_THRESHOLD_SET = 0x8A,
     ROBOT_FRAME_ACK = 0xF0,
 } robot_frame_type_t;
 
@@ -155,6 +158,30 @@ typedef struct __attribute__((packed)) {
     uint16_t hp;
     uint32_t transaction_id;
 } robot_set_hp_v2_frame_t;
+
+/* Input intent: 0=unknown, 1=still, 2=moving. Change + 500-ms recovery. */
+typedef struct __attribute__((packed)) {
+    uint16_t magic;
+    uint8_t version, frame_type, robot_id, motion, sequence;
+} robot_motion_v2_frame_t;
+
+/* One NodeID, one profile (0=still, 1=moving); saved by L431, not armor. */
+typedef struct __attribute__((packed)) {
+    uint16_t magic;
+    uint8_t version, frame_type, robot_id, node, profile;
+    uint32_t value, transaction_id;
+} robot_threshold_set_v2_frame_t;
+
+/* L431 authoritative snapshot. ACK=stored; applied_mask=CAN ACK received. */
+typedef struct __attribute__((packed)) {
+    uint16_t magic;
+    uint8_t version, frame_type, robot_id, node, motion;
+    uint8_t applied_mask, failed_mask, storage_status;
+    uint32_t still, moving, applied;
+} robot_threshold_state_v2_frame_t;
+_Static_assert(sizeof(robot_motion_v2_frame_t) == 7U, "motion size");
+_Static_assert(sizeof(robot_threshold_set_v2_frame_t) == 15U, "threshold set size");
+_Static_assert(sizeof(robot_threshold_state_v2_frame_t) == 22U, "threshold state size");
 
 /* Both directions, transport acknowledgement. Size: 10 bytes. */
 typedef struct __attribute__((packed)) {

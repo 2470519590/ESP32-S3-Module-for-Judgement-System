@@ -23,6 +23,7 @@
 
 #include "robot_protocol.h"
 #include "l431_link.h"
+#include "controller_motion.h"
 #include "xbox_ble.h"
 
 /* Keep older generated sdkconfig files buildable while configuration is regenerated. */
@@ -75,11 +76,22 @@ static const char *server_ip_current(void)
 
 static const char *TAG = "robot_net";
 static SemaphoreHandle_t s_status_rgb_mutex;
+static SemaphoreHandle_t s_l431_tx_mutex;
 static rmt_channel_handle_t s_status_rgb_channel;
 static rmt_encoder_handle_t s_status_rgb_encoder;
 static uint8_t s_status_rgb_data[3];
 static uint16_t read_u16le(const uint8_t *data);
 static int8_t xbox_axis_to_i8(uint16_t value);
+
+static int l431_uart_write(const void *data, size_t length)
+{
+    int result;
+    if (s_l431_tx_mutex == NULL) return -1;
+    xSemaphoreTake(s_l431_tx_mutex, portMAX_DELAY);
+    result = uart_write_bytes(UART_NUM_1, data, length);
+    xSemaphoreGive(s_l431_tx_mutex);
+    return result;
+}
 
 static const uint8_t s_status_rgb_profile_colors[3][3] = {
     {0U, 0U, STATUS_RGB_BRIGHTNESS},
@@ -173,6 +185,10 @@ static QueueHandle_t s_downlink_queue;
 static SemaphoreHandle_t s_reliable_mutex;
 static SemaphoreHandle_t s_completed_mutex;
 static SemaphoreHandle_t s_identity_mutex;
+static volatile uint8_t s_motion;
+static l431_threshold_t s_threshold_state[4];
+static TickType_t s_threshold_tick[4];
+static bool s_threshold_seen[4];
 static volatile bool s_l431_status_seen;
 static volatile TickType_t s_l431_last_status_tick;
 static volatile uint8_t s_l431_valid_status_count;
@@ -230,6 +246,8 @@ typedef struct {
     uint8_t frame_type;
     uint8_t l431_command;
     uint16_t hp;
+    uint8_t node, profile;
+    uint32_t threshold;
     uint32_t transaction_id;
     struct sockaddr_in peer;
 } downlink_command_t;
@@ -262,6 +280,15 @@ static completed_downlink_t s_completed_downlinks[COMPLETED_DOWNLINK_CAPACITY];
 static uint8_t s_completed_downlink_next;
 
 static bool queue_event(robot_frame_type_t frame_type, uint16_t hp);
+static void l431_on_threshold(const l431_threshold_t *state, void *context)
+{
+    (void)context;
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    s_threshold_state[state->node - 1U] = *state;
+    s_threshold_tick[state->node - 1U] = xTaskGetTickCount();
+    s_threshold_seen[state->node - 1U] = true;
+    xSemaphoreGive(s_status_mutex);
+}
 static bool persist_reliable_events(void);
 static bool enqueue_reliable_event(robot_frame_type_t frame_type, uint8_t l431_sequence);
 static bool find_completed_downlink(uint8_t frame_type, uint32_t transaction_id,
@@ -282,7 +309,7 @@ static bool send_l431_event_ack(l431_event_t event, uint8_t sequence)
     frame[1] = (uint8_t)((frame[0] << 4U) | (frame[0] >> 4U));
     frame[2] = sequence;
     frame[3] = l431_link_crc8(frame, 3U);
-    return uart_write_bytes(UART_NUM_1, frame, sizeof(frame)) == sizeof(frame);
+    return l431_uart_write(frame, sizeof(frame)) == sizeof(frame);
 }
 
 /* Fail closed: no L431PM state has been confirmed at ESP32 boot. */
@@ -604,10 +631,12 @@ static bool downlink_targets_this_robot(uint8_t target_robot_id)
 }
 
 static uint8_t forward_l431_command(uint8_t command, uint32_t transaction_id,
-                                    uint16_t hp)
+                                    uint16_t hp, uint8_t node, uint8_t profile,
+                                    uint32_t threshold)
 {
-    uint8_t frame[9];
-    const uint8_t length = (command == 0xC3U || command == 0xC7U || command == 0xC8U) ? 9U : 7U;
+    uint8_t frame[13];
+    const uint8_t length = command == 0xC9U ? 13U :
+        ((command == 0xC3U || command == 0xC7U || command == 0xC8U) ? 9U : 7U);
     l431_ack_t ack;
 
     /* Defense in depth: server control must never reach physical MOS commands. */
@@ -626,10 +655,14 @@ static uint8_t forward_l431_command(uint8_t command, uint32_t transaction_id,
         frame[6] = (uint8_t)hp;
         frame[7] = (uint8_t)(hp >> 8U);
     }
+    if (length == 13U) {
+        frame[6] = node; frame[7] = profile;
+        memcpy(&frame[8], &threshold, 4U);
+    }
     frame[length - 1U] = l431_link_crc8(frame, (uint8_t)(length - 1U));
     ESP_LOGI(TAG, "L431 TX cmd=0x%02X tx=%" PRIu32 " len=%u crc=0x%02X",
              command, transaction_id, length, frame[length - 1U]);
-    (void)uart_write_bytes(UART_NUM_1, frame, length);
+    if (l431_uart_write(frame, length) != length) return 2U;
 
     const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(200);
     while (xTaskGetTickCount() < deadline) {
@@ -659,7 +692,7 @@ static void downlink_command_task(void *arg)
         if (xQueueReceive(s_downlink_queue, &work, portMAX_DELAY) != pdPASS) continue;
         uint8_t result;
         if (work.frame_type == 0U) {
-            result = forward_l431_command(work.l431_command, work.transaction_id, work.hp);
+            result = forward_l431_command(work.l431_command, work.transaction_id, work.hp, 0U, 0U, 0U);
             if (result == 0U) s_wifi_l431_synced = work.hp;
             continue;
         }
@@ -669,7 +702,8 @@ static void downlink_command_task(void *arg)
                 s_controller_soft_power_off = work.frame_type == ROBOT_FRAME_FORCE_POWER_OFF;
                 result = 0U;
             } else {
-                result = forward_l431_command(work.l431_command, work.transaction_id, work.hp);
+                result = forward_l431_command(work.l431_command, work.transaction_id, work.hp,
+                                               work.node, work.profile, work.threshold);
             }
             if (result != 2U)
                 remember_completed_downlink(work.frame_type, work.transaction_id, result);
@@ -894,6 +928,22 @@ static void handle_server_datagram(int sock, const uint8_t *data, size_t length,
         robot_network_on_server_datagram(data, length);
         return;
     }
+    if (data[3] == ROBOT_FRAME_ARMOR_THRESHOLD_SET && length == sizeof(robot_threshold_set_v2_frame_t)) {
+        robot_threshold_set_v2_frame_t command;
+        memcpy(&command, data, sizeof(command));
+        if (!downlink_targets_this_robot(command.robot_id)) return;
+        uint8_t result;
+        if (find_completed_downlink(command.frame_type, command.transaction_id, &result)) {
+            send_server_ack(sock, peer, command.frame_type, command.transaction_id, result);
+            return;
+        }
+        const downlink_command_t work = {.frame_type = command.frame_type, .l431_command = 0xC9U,
+            .transaction_id = command.transaction_id, .node = command.node,
+            .profile = command.profile, .threshold = command.value, .peer = *peer};
+        if (xQueueSend(s_downlink_queue, &work, 0) != pdPASS)
+            send_server_ack(sock, peer, command.frame_type, command.transaction_id, 2U);
+        return;
+    }
 
     /* Approval includes the outstanding request's UART sequence and UDP tx.
      * Match it before forwarding, so a delayed approval cannot revive a new death. */
@@ -1027,6 +1077,8 @@ static void robot_send_task(void *arg)
     int sock = -1;
     TickType_t last_status_tick = xTaskGetTickCount();
     TickType_t last_announce_tick = last_status_tick - pdMS_TO_TICKS(DEVICE_ANNOUNCE_PERIOD_MS);
+    TickType_t last_motion_tick = last_status_tick - pdMS_TO_TICKS(500U);
+    uint8_t last_motion = 0xFFU, motion_sequence = 0U, threshold_slot = 0U;
 
     while (true) {
         server.sin_addr.s_addr = inet_addr(server_ip_current());
@@ -1065,6 +1117,28 @@ static void robot_send_task(void *arg)
          * attribute an event from robot 0. */
         const uint8_t robot_id = robot_id_snapshot();
         if (robot_id != 0U) {
+            const uint8_t motion = s_motion;
+            const TickType_t now = xTaskGetTickCount();
+            if (motion != last_motion || now - last_motion_tick >= pdMS_TO_TICKS(500U)) {
+                const robot_motion_v2_frame_t frame = {ROBOT_PROTOCOL_MAGIC, ROBOT_PROTOCOL_VERSION,
+                    ROBOT_FRAME_MOTION, robot_id, motion, motion_sequence++};
+                if (send_frame(sock, &server, &frame, sizeof(frame))) {
+                    last_motion = motion; last_motion_tick = now;
+                }
+            }
+            xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+            const l431_threshold_t state = s_threshold_state[threshold_slot];
+            const bool valid = s_threshold_seen[threshold_slot] &&
+                now - s_threshold_tick[threshold_slot] < pdMS_TO_TICKS(700U);
+            xSemaphoreGive(s_status_mutex);
+            if (valid) {
+                const robot_threshold_state_v2_frame_t frame = {ROBOT_PROTOCOL_MAGIC, ROBOT_PROTOCOL_VERSION,
+                    ROBOT_FRAME_ARMOR_THRESHOLD_STATE, robot_id, state.node, state.motion,
+                    state.applied_mask, state.failed_mask, state.storage_status,
+                    state.still, state.moving, state.applied};
+                send_frame(sock, &server, &frame, sizeof(frame));
+            }
+            threshold_slot = (uint8_t)((threshold_slot + 1U) % 4U);
             pending_event_t event;
             while (xQueueReceive(s_event_queue, &event, 0) == pdPASS) {
                 switch (event.frame_type) {
@@ -1435,6 +1509,7 @@ static void controller_uart_task(void *arg)
 {
     uint8_t sequence = 0;
     TickType_t last = xTaskGetTickCount();
+    controller_motion_t motion = {.last_active_ms = (uint32_t)(last * portTICK_PERIOD_MS)};
     (void)arg;
     while (true) {
         uint8_t report[16] = {0}; uint32_t age_ms = UINT32_MAX; bool connected = false;
@@ -1446,6 +1521,10 @@ static void controller_uart_task(void *arg)
          * Server soft-power lockout is independent of the death state. */
         const bool control_allowed = report_fresh && !s_controller_death_blocked &&
                                      !s_controller_soft_power_off;
+        s_motion = controller_motion_update(&motion,
+            (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS), report_fresh,
+            connected, control_allowed, xbox_axis_to_i8(read_u16le(&report[0])),
+            xbox_axis_to_i8(read_u16le(&report[2])), report[13]);
         controller_state_frame_t frame = {.magic0 = 0xC3U, .magic1 = 0x3CU,
             .sequence = sequence++,
             .flags = (uint8_t)((connected ? 0x01U : 0U) |
@@ -1462,6 +1541,25 @@ static void controller_uart_task(void *arg)
         frame.crc8 = crc8_atm((const uint8_t *)&frame, sizeof(frame) - 1U);
         (void)uart_write_bytes(UART_NUM_0, &frame, sizeof(frame));
         vTaskDelayUntil(&last, pdMS_TO_TICKS(10));
+    }
+}
+
+static void motion_link_task(void *arg)
+{
+    uint8_t previous = 0xFFU, sequence = 0U;
+    TickType_t sent_at = xTaskGetTickCount() - pdMS_TO_TICKS(250U);
+    (void)arg;
+    while (true) {
+        const uint8_t motion = s_motion;
+        const TickType_t now = xTaskGetTickCount();
+        if (motion != previous || now - sent_at >= pdMS_TO_TICKS(250U)) {
+            uint8_t frame[5] = {0xCAU, 0xACU, motion, sequence++};
+            frame[4] = l431_link_crc8(frame, 4U);
+            if (l431_uart_write(frame, sizeof(frame)) == sizeof(frame)) {
+                previous = motion; sent_at = now;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10U));
     }
 }
 
@@ -1487,13 +1585,14 @@ void app_main(void)
 
     s_status_mutex = xSemaphoreCreateMutex();
     s_status_rgb_mutex = xSemaphoreCreateMutex();
+    s_l431_tx_mutex = xSemaphoreCreateMutex();
     s_event_queue = xQueueCreate(EVENT_QUEUE_LENGTH, sizeof(pending_event_t));
     s_l431_ack_queue = xQueueCreate(4, sizeof(l431_ack_t));
     s_downlink_queue = xQueueCreate(4, sizeof(downlink_command_t));
     s_reliable_mutex = xSemaphoreCreateMutex();
     s_completed_mutex = xSemaphoreCreateMutex();
     s_identity_mutex = xSemaphoreCreateMutex();
-    configASSERT(s_status_mutex != NULL && s_status_rgb_mutex != NULL && s_event_queue != NULL &&
+    configASSERT(s_status_mutex != NULL && s_status_rgb_mutex != NULL && s_l431_tx_mutex != NULL && s_event_queue != NULL &&
                  s_l431_ack_queue != NULL && s_downlink_queue != NULL &&
                  s_reliable_mutex != NULL && s_completed_mutex != NULL &&
                  s_identity_mutex != NULL);
@@ -1504,6 +1603,7 @@ void app_main(void)
         .on_status = l431_on_status,
         .on_event = l431_on_event,
         .on_ack = l431_on_ack,
+        .on_threshold = l431_on_threshold,
     });
 #if !CONFIG_ROBOT_TEST_MODE
     xTaskCreate(l431_uart_task, "l431_uart", 3072, NULL, 5, NULL);
@@ -1514,6 +1614,7 @@ void app_main(void)
     status_rgb_set_profile(s_wifi_profile);
     xTaskCreate(status_rgb_task, "status_rgb", 2048, NULL, 2, NULL);
     xTaskCreate(controller_uart_task, "controller_uart", 2048, NULL, 5, NULL);
+    xTaskCreate(motion_link_task, "motion_link", 2048, NULL, 4, NULL);
     xTaskCreate(wifi_profile_task, "wifi_profile", 3072, NULL, 4, NULL);
     xTaskCreate(robot_send_task, "robot_udp", 3072, NULL, 4, NULL);
     xTaskCreate(robot_receive_task, "robot_udp_rx", 3072, NULL, 4, NULL);

@@ -31,11 +31,16 @@ typedef void (*l431_status_callback_t)(const l431_status_t *status, void *contex
 typedef void (*l431_event_callback_t)(l431_event_t event, uint8_t sequence, void *context);
 typedef void (*l431_ack_callback_t)(uint8_t command, uint32_t transaction_id,
                                     uint8_t result, void *context);
+typedef struct {
+    uint8_t motion, applied_mask, failed_mask, storage_status, node;
+    uint32_t still, moving, applied;
+} l431_threshold_t;
 
 typedef struct {
     l431_status_callback_t on_status;
     l431_event_callback_t on_event;
     l431_ack_callback_t on_ack;
+    void (*on_threshold)(const l431_threshold_t *state, void *context);
     void *context;
 } l431_link_callbacks_t;
 

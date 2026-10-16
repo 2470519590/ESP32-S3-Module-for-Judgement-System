@@ -3,7 +3,7 @@
 #include <string.h>
 
 static l431_link_callbacks_t s_callbacks;
-static uint8_t s_rx[12];
+static uint8_t s_rx[21];
 static uint8_t s_length;
 
 uint8_t l431_link_crc8(const uint8_t *data, uint8_t length)
@@ -38,7 +38,7 @@ void l431_link_init(const l431_link_callbacks_t *callbacks)
 void l431_link_feed(uint8_t byte)
 {
     uint8_t expected = 0;
-    if (s_length == 0U) { if (byte == 0xA5U || (byte >= 0xB1U && byte <= 0xB8U) || (byte >= 0xD1U && byte <= 0xD8U)) s_rx[s_length++] = byte; return; }
+    if (s_length == 0U) { if (byte == 0xA5U || byte == 0xA6U || (byte >= 0xB1U && byte <= 0xB8U) || (byte >= 0xD1U && byte <= 0xD9U)) s_rx[s_length++] = byte; return; }
     if (s_length == 1U) {
         const uint8_t first = s_rx[0];
         const uint8_t second = (first == 0xA5U) ? 0x5AU :
@@ -46,11 +46,17 @@ void l431_link_feed(uint8_t byte)
         if (byte == second) s_rx[s_length++] = byte; else { s_length = 0; l431_link_feed(byte); }
         return;
     }
-    expected = (s_rx[0] == 0xA5U) ? 12U : ((s_rx[0] >= 0xB1U && s_rx[0] <= 0xB8U) ? 4U : 8U);
+    expected = s_rx[0] == 0xA6U ? 21U : ((s_rx[0] == 0xA5U) ? 12U : ((s_rx[0] >= 0xB1U && s_rx[0] <= 0xB8U) ? 4U : 8U));
     s_rx[s_length++] = byte;
     if (s_length < expected) return;
     if (l431_link_crc8(s_rx, (uint8_t)(expected - 1U)) == s_rx[expected - 1U]) {
-        if (s_rx[0] == 0xA5U && s_callbacks.on_status != NULL) {
+        if (s_rx[0] == 0xA6U) {
+            const l431_threshold_t state = {.motion = s_rx[3], .applied_mask = s_rx[4],
+                .failed_mask = s_rx[5], .storage_status = s_rx[6], .node = s_rx[7],
+                .still = le32(&s_rx[8]), .moving = le32(&s_rx[12]), .applied = le32(&s_rx[16])};
+            if (s_callbacks.on_threshold && state.node >= 1U && state.node <= 4U)
+                s_callbacks.on_threshold(&state, s_callbacks.context);
+        } else if (s_rx[0] == 0xA5U && s_callbacks.on_status != NULL) {
             l431_status_t status = {.sequence = s_rx[2], .alive = (s_rx[3] & 1U) != 0U,
                 .shoot_enabled = (s_rx[3] & 2U) != 0U, .power_on = (s_rx[3] & 4U) != 0U,
                 .hp = le16(&s_rx[4]),

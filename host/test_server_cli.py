@@ -42,7 +42,11 @@ FRAME_FORCE_POWER_OFF = 0x87
 FRAME_FORCE_POWER_ON = 0x88
 FRAME_REVIVE_REQUEST = 0x0D
 FRAME_REVIVE_APPROVE = 0x89
+FRAME_MOTION = 0x0E
+FRAME_ARMOR_THRESHOLD_STATE = 0x0F
+FRAME_ARMOR_THRESHOLD_SET = 0x8A
 FRAME_ACK = 0xF0
+MOTION_NAMES = {0: "UNKNOWN", 1: "STILL", 2: "MOVING"}
 
 EVENT_NAMES = {
     FRAME_REVIVE_REQUEST: "REVIVE_REQUEST",
@@ -86,6 +90,15 @@ def decode(data: bytes) -> str:
             return f"V1 EVENT type={frame_type} robot={robot} team={team}"
 
     if version == V2:
+        if frame_type == FRAME_MOTION and len(data) == 7:
+            _, _, _, robot, motion, sequence = struct.unpack("<HBBBBB", data)
+            return f"V2 MOTION robot={robot} {MOTION_NAMES.get(motion, 'INVALID')} seq={sequence}"
+        if frame_type == FRAME_ARMOR_THRESHOLD_STATE and len(data) == 22:
+            _, _, _, robot, node, motion, applied_mask, failed_mask, storage, still, moving, applied = struct.unpack(
+                "<HBBBBBBBBIII", data)
+            return (f"V2 THRESHOLD robot={robot} node={node} still={still} moving={moving} "
+                    f"applied={applied} masks={applied_mask:01X}/{failed_mask:01X} storage={storage} "
+                    f"motion={MOTION_NAMES.get(motion, 'INVALID')}")
         if frame_type == FRAME_REVIVE_REQUEST and len(data) == 10:
             _, _, _, robot, sequence, transaction_id = struct.unpack("<HBBBBI", data)
             return f"V2 REVIVE_REQUEST robot={robot} seq={sequence} tx={transaction_id}"
@@ -139,6 +152,19 @@ class RobotMetrics:
 
 
 @dataclass
+class ThresholdCommand:
+    robot: int
+    node: int
+    profile: int
+    value: int
+    ip: str
+    frame: bytes
+    sent_at: float
+    attempts: int = 1
+    result: str = "PENDING"
+
+
+@dataclass
 class CliServer:
     sock: socket.socket
     robot_port: int
@@ -164,6 +190,46 @@ class CliServer:
     devices: dict[str, DeviceEntry] = field(default_factory=dict)
     metrics: dict[int, RobotMetrics] = field(default_factory=dict)
     revive_requests: dict[int, tuple[int, int]] = field(default_factory=dict)
+    motion: dict[int, tuple[int, float]] = field(default_factory=dict)
+    thresholds: dict[tuple[int, int], tuple[int, int, int, int, int, int, int, float]] = field(default_factory=dict)
+    threshold_commands: dict[int, ThresholdCommand] = field(default_factory=dict)
+
+    def service_threshold_commands(self) -> None:
+        now = time.monotonic()
+        with self.stats_lock:
+            for command in self.threshold_commands.values():
+                if command.result != "PENDING" or now - command.sent_at < 1.0:
+                    continue
+                if command.attempts >= 3:
+                    command.result = "TIMEOUT"
+                    continue
+                try:
+                    self.sock.sendto(command.frame, (command.ip, self.robot_port))
+                except OSError:
+                    pass
+                command.attempts += 1
+                command.sent_at = now
+
+    def threshold_table(self, robot: int) -> str:
+        now = time.monotonic()
+        rows = [f"R{robot} ARMOR THRESHOLDS: node | still | moving | applied | CAN | storage | L431 motion"]
+        for node in range(1, 5):
+            state = self.thresholds.get((robot, node))
+            if state is None or now - state[-1] > 2.0:
+                rows.append(f"{node:>4} | UNKNOWN (no fresh L431 snapshot)")
+                continue
+            still, moving, applied, applied_mask, failed_mask, storage, motion, _ = state
+            can = "APPLIED" if applied_mask & (1 << (node - 1)) else (
+                "RETRY" if failed_mask & (1 << (node - 1)) else "PENDING/OFFLINE")
+            rows.append(f"{node:>4} | {still} | {moving} | {applied or '-'} | {can} | "
+                        f"{['DEFAULT', 'SAVED', 'SAVE_FAILED'][min(storage, 2)]} | "
+                        f"{MOTION_NAMES.get(motion, 'UNKNOWN')}")
+        for tx, command in self.threshold_commands.items():
+            if command.robot == robot:
+                rows.append(f"tx={tx} node={command.node} {'moving' if command.profile else 'still'}="
+                            f"{command.value} {command.result}")
+        return "\n".join(rows)
+
     def output(self, text: str) -> None:
         if self.ui_message is not None:
             self.ui_message(text)
@@ -240,7 +306,8 @@ class CliServer:
             return
         metric = self.metrics.setdefault(robot, RobotMetrics())
         metric.rx += 1
-        if frame_type == FRAME_STATUS:
+        if frame_type in {FRAME_STATUS, FRAME_DEVICE_HEALTH, FRAME_MOTION,
+                          FRAME_ARMOR_THRESHOLD_STATE}:
             metric.status += 1
         else:
             metric.events += 1
@@ -294,7 +361,29 @@ class CliServer:
                     self.robot_peers[robot] = peer[0]
                     self.window_status += 1
                     self.record_robot_packet(robot, frame_type, now)
+                elif frame_type == FRAME_MOTION and len(data) == 7:
+                    _, _, _, robot, motion, _sequence = struct.unpack("<HBBBBB", data)
+                    if motion in MOTION_NAMES:
+                        self.motion[robot] = (motion, now)
+                    self.window_status += 1
+                    self.record_robot_packet(robot, frame_type, now)
+                elif frame_type == FRAME_ARMOR_THRESHOLD_STATE and len(data) == 22:
+                    _, _, _, robot, node, motion, applied_mask, failed_mask, storage, still, moving, applied = struct.unpack(
+                        "<HBBBBBBBBIII", data)
+                    if 1 <= node <= 4 and motion in MOTION_NAMES:
+                        self.thresholds[robot, node] = (still, moving, applied, applied_mask,
+                                                       failed_mask, storage, motion, now)
+                    self.window_status += 1
+                    self.record_robot_packet(robot, frame_type, now)
                 elif frame_type == FRAME_ACK and len(data) == 10:
+                    _, _, _, kind, tx, result = struct.unpack("<HBBBIB", data)
+                    command = self.threshold_commands.get(tx)
+                    if kind == FRAME_ARMOR_THRESHOLD_SET and command and peer[0] == command.ip:
+                        if result == 0:
+                            command.result = "SAVED (CAN application follows)"
+                        elif result == 1:
+                            command.result = "REJECTED"
+                        # result=2 is transient; keep retrying the same tx.
                     self.window_protocol_acks += 1
                     self.last_event = decode(data)
                 elif frame_type == FRAME_REVIVE_REQUEST and len(data) == 10:
@@ -314,6 +403,7 @@ class CliServer:
                 self.window_bad += 1
 
     def summary(self) -> str:
+        self.service_threshold_commands()
         with self.stats_lock:
             rx, status, events, bad = (self.window_rx, self.window_status,
                                        self.window_events, self.window_bad)
@@ -322,7 +412,7 @@ class CliServer:
             self.window_rx = self.window_status = self.window_events = self.window_bad = 0
             self.window_auto_acks = 0
             self.window_protocol_acks = 0
-            robots = sorted(set(self.last_status) | set(self.last_health))
+            robots = sorted(set(self.last_status) | set(self.last_health) | set(self.motion))
             states = " ".join(
                 self.format_robot_state(robot)
                 for robot in robots
@@ -352,13 +442,15 @@ class CliServer:
         business = (f"hp={status[0]} heat={status[1]} power={status[2]}W alive={status[3]} "
                     f"shoot={status[4]} pwr={'ON' if status[5] else 'OFF'}") if status else "business=NO_STATUS"
         armor = "/".join("ON" if health & (1 << (node + 2)) else "OFF" for node in range(4))
+        motion, seen = self.motion.get(robot, (0, 0.0))
+        motion_text = MOTION_NAMES.get(motion, "UNKNOWN") if time.monotonic() - seen <= 2.0 else "UNKNOWN"
         return (f"R{robot}:{business} l431={'ON' if health & 0x01 else 'OFF'} "
-                f"gun={'ON' if health & 0x02 else 'OFF'} armor[1..4]={armor}")
+                f"gun={'ON' if health & 0x02 else 'OFF'} armor[1..4]={armor} motion={motion_text}")
 
     def current_state_line(self) -> str:
         """Current version of summary's existing third line; no counters reset."""
         with self.stats_lock:
-            robots = sorted(set(self.last_status) | set(self.last_health))
+            robots = sorted(set(self.last_status) | set(self.last_health) | set(self.motion))
             states = " ".join(self.format_robot_state(robot) for robot in robots) or "-"
             return f"   {states} | last={self.last_event}"
 
@@ -467,6 +559,7 @@ def server_command(self: CliServer, line: str) -> bool:
         return False
     if name == "help":
         self.output("Commands: devices | stats | assign ROBOT_ID CONTROLLER_MAC | reassign OLD_ROBOT_ID NEW_ROBOT_ID CONTROLLER_MAC | revive ROBOT_ID | start/end/yellow/power_on/power_off/status ROBOT_ID | hp ROBOT_ID HP | quit")
+        self.output("armor_thr ROBOT_ID NODE_ID still/moving VALUE | armor_thr_show ROBOT_ID")
         return True
     if name in {"devices", "device", "registry"}:
         self.output(self.device_table())
@@ -475,7 +568,30 @@ def server_command(self: CliServer, line: str) -> bool:
         self.output(self.summary())
         return True
     try:
-        if name in {"reassign", "renumber"} and len(parts) == 4:
+        if name == "armor_thr_show" and len(parts) == 2:
+            with self.stats_lock:
+                text = self.threshold_table(int(parts[1]))
+            self.output(text)
+        elif name == "armor_thr" and len(parts) == 5:
+            robot, node, value = int(parts[1]), int(parts[2]), int(parts[4])
+            if parts[3].lower() not in {"still", "moving"}:
+                raise ValueError("profile must be still or moving")
+            profile = int(parts[3].lower() == "moving")
+            if not 1 <= node <= 4 or not 1000 <= value <= 67108864:
+                raise ValueError("node must be 1..4; threshold must be 1000..67108864")
+            ip = self.robot_ip(robot)
+            tx = self.next_transaction()
+            frame = struct.pack("<HBBBBBII", MAGIC, V2, FRAME_ARMOR_THRESHOLD_SET, robot, node, profile, value, tx)
+            with self.stats_lock:
+                if any(command.robot == robot and command.result == "PENDING"
+                       for command in self.threshold_commands.values()):
+                    raise ValueError("wait for the previous threshold command ACK before changing this robot again")
+                self.threshold_commands = {key: command for key, command in self.threshold_commands.items()
+                                           if command.result == "PENDING" or command.robot != robot or
+                                           (command.node, command.profile) != (node, profile)}
+                self.threshold_commands[tx] = ThresholdCommand(robot, node, profile, value, ip, frame, time.monotonic())
+            self.send(ip, frame, f"ARMOR_THRESHOLD target={robot} node={node} {parts[3]}={value} tx={tx}")
+        elif name in {"reassign", "renumber"} and len(parts) == 4:
             old_robot_id = int(parts[1])
             new_robot_id = int(parts[2])
             if not 1 <= old_robot_id <= 255 or not 1 <= new_robot_id <= 255:
